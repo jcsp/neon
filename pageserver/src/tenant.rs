@@ -368,6 +368,7 @@ impl Tenant {
         &self,
         timeline_id: TimelineId,
         remote_client: Option<RemoteTimelineClient>,
+        deletion_queue_client: Option<DeletionQueueClient>,
         remote_startup_data: Option<RemoteStartupData>,
         local_metadata: Option<TimelineMetadata>,
         ancestor: Option<Arc<Timeline>>,
@@ -389,6 +390,7 @@ impl Tenant {
             up_to_date_metadata,
             ancestor.clone(),
             remote_client,
+            deletion_queue_client,
             init_order,
             CreateTimelineCause::Load,
         )?;
@@ -560,6 +562,11 @@ impl Tenant {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cannot attach without remote storage"))?;
 
+        let deletion_queue_client = self
+            .deletion_queue_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cannot attach without deletion queue enabled"))?;
+
         let remote_timeline_ids = remote_timeline_client::list_remote_timelines(
             remote_storage,
             self.conf,
@@ -630,14 +637,21 @@ impl Tenant {
                 .expect("just put it in above");
 
             // TODO again handle early failure
-            self.load_remote_timeline(timeline_id, index_part, remote_metadata, remote_client, ctx)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to load remote timeline {} for tenant {}",
-                        timeline_id, self.tenant_id
-                    )
-                })?;
+            self.load_remote_timeline(
+                timeline_id,
+                index_part,
+                remote_metadata,
+                remote_client,
+                deletion_queue_client.clone(),
+                ctx,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load remote timeline {} for tenant {}",
+                    timeline_id, self.tenant_id
+                )
+            })?;
         }
 
         std::fs::remove_file(&marker_file)
@@ -674,6 +688,7 @@ impl Tenant {
         index_part: IndexPart,
         remote_metadata: TimelineMetadata,
         remote_client: RemoteTimelineClient,
+        deletion_queue_client: DeletionQueueClient,
         ctx: &RequestContext,
     ) -> anyhow::Result<()> {
         span::debug_assert_current_span_has_tenant_id();
@@ -704,6 +719,7 @@ impl Tenant {
         self.timeline_init_and_sync(
             timeline_id,
             Some(remote_client),
+            Some(deletion_queue_client),
             Some(RemoteStartupData {
                 index_part,
                 remote_metadata,
@@ -1128,6 +1144,7 @@ impl Tenant {
                                 timeline_id,
                                 &local_metadata,
                                 Some(remote_client),
+                                self.deletion_queue_client.clone(),
                                 init_order,
                             )
                             .await
@@ -1180,6 +1197,7 @@ impl Tenant {
                         timeline_id,
                         &local_metadata,
                         None,
+                        None,
                         init_order,
                     )
                     .await
@@ -1204,6 +1222,7 @@ impl Tenant {
         self.timeline_init_and_sync(
             timeline_id,
             remote_client,
+            self.deletion_queue_client.clone(),
             remote_startup_data,
             Some(local_metadata),
             ancestor,
@@ -2041,6 +2060,7 @@ impl Tenant {
         new_metadata: &TimelineMetadata,
         ancestor: Option<Arc<Timeline>>,
         remote_client: Option<RemoteTimelineClient>,
+        deletion_queue: Option<DeletionQueueClient>,
         init_order: Option<&InitializationOrder>,
         cause: CreateTimelineCause,
     ) -> anyhow::Result<Arc<Timeline>> {
@@ -2070,6 +2090,7 @@ impl Tenant {
             self.tenant_id,
             Arc::clone(&self.walredo_mgr),
             remote_client,
+            deletion_queue,
             pg_version,
             initial_logical_size_can_start.cloned(),
             initial_logical_size_attempt.cloned(),
@@ -2758,6 +2779,7 @@ impl Tenant {
                 new_metadata,
                 ancestor,
                 remote_client,
+                self.deletion_queue_client.clone(),
                 None,
                 CreateTimelineCause::Load,
             )
