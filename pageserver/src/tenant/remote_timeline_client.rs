@@ -206,7 +206,7 @@ mod download;
 pub mod index;
 mod upload;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use chrono::{NaiveDateTime, Utc};
 // re-export these
 pub use download::{is_temp_download_file, list_remote_timelines};
@@ -224,6 +224,7 @@ use tracing::{debug, error, info, instrument, warn};
 use tracing::{info_span, Instrument};
 use utils::lsn::Lsn;
 
+use crate::deletion_queue::DeletionQueueClient;
 use crate::metrics::{
     MeasureRemoteOp, RemoteOpFileKind, RemoteOpKind, RemoteTimelineClientMetrics,
     RemoteTimelineClientMetricsCallTrackSize, REMOTE_ONDEMAND_DOWNLOADED_BYTES,
@@ -626,25 +627,22 @@ impl RemoteTimelineClient {
     /// deletion won't actually be performed, until any previously scheduled
     /// upload operations, and the index file upload, have completed
     /// successfully.
-    pub fn schedule_layer_file_deletion(
+    pub async fn schedule_layer_file_deletion(
         self: &Arc<Self>,
         names: &[LayerFileName],
+        deletion_queue_client: &DeletionQueueClient,
     ) -> anyhow::Result<()> {
-        let mut guard = self.upload_queue.lock().unwrap();
-        let upload_queue = guard.initialized_mut()?;
+        // Synchronous update of upload queues under mutex
+        {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut()?;
 
-        // Deleting layers doesn't affect the values stored in TimelineMetadata,
-        // so we don't need update it. Just serialize it.
-        let metadata_bytes = upload_queue.latest_metadata.to_bytes()?;
+            // Deleting layers doesn't affect the values stored in TimelineMetadata,
+            // so we don't need update it. Just serialize it.
+            let metadata_bytes = upload_queue.latest_metadata.to_bytes()?;
 
-        // Update the remote index file, removing the to-be-deleted files from the index,
-        // before deleting the actual files.
-        //
-        // Once we start removing files from upload_queue.latest_files, there's
-        // no going back! Otherwise, some of the files would already be removed
-        // from latest_files, but not yet scheduled for deletion. Use a closure
-        // to syntactically forbid ? or bail! calls here.
-        let no_bail_here = || {
+            // Update the remote index file, removing the to-be-deleted files from the index,
+            // before deleting the actual files.
             for name in names {
                 upload_queue.latest_files.remove(name);
                 upload_queue.latest_files_changes_since_metadata_upload_scheduled += 1;
@@ -653,23 +651,21 @@ impl RemoteTimelineClient {
             if upload_queue.latest_files_changes_since_metadata_upload_scheduled > 0 {
                 self.schedule_index_upload(upload_queue, metadata_bytes);
             }
+        }
 
-            // schedule the actual deletions
-            for name in names {
-                let op = UploadOp::Delete(Delete {
-                    file_kind: RemoteOpFileKind::Layer,
-                    layer_file_name: name.clone(),
-                    scheduled_from_timeline_delete: false,
-                });
-                self.calls_unfinished_metric_begin(&op);
-                upload_queue.queued_operations.push_back(op);
-                info!("scheduled layer file deletion {name}");
-            }
+        // Barrier: we must ensure all prior uploads and index writes have landed in S3
+        // before emitting deletions.
+        if let Err(e) = self.wait_completion().await {
+            // This can only fail if upload queue is shut down: if this happens, we do
+            // not emit any deletions.  In this condition (remote client is shut down
+            // during compaction or GC) we may leak some objects.
+            bail!("Cannot complete layer file deletions during shutdown ({e})");
+        }
 
-            // Launch the tasks immediately, if possible
-            self.launch_queued_tasks(upload_queue);
-        };
-        no_bail_here();
+        // Enqueue deletions
+        deletion_queue_client
+            .push(self.tenant_id, self.timeline_id, names.to_vec())
+            .await;
         Ok(())
     }
 
@@ -1305,6 +1301,7 @@ mod tests {
     use super::*;
     use crate::{
         context::RequestContext,
+        deletion_queue::mock::MockDeletionQueue,
         tenant::{
             harness::{TenantHarness, TIMELINE_ID},
             Tenant,
@@ -1373,6 +1370,7 @@ mod tests {
         tenant_ctx: RequestContext,
         remote_fs_dir: PathBuf,
         client: Arc<RemoteTimelineClient>,
+        deletion_queue: MockDeletionQueue,
     }
 
     impl TestSetup {
@@ -1419,13 +1417,15 @@ mod tests {
                 runtime,
                 tenant_id: harness.tenant_id,
                 timeline_id: TIMELINE_ID,
-                storage_impl: storage,
+                storage_impl: storage.clone(),
                 upload_queue: Mutex::new(UploadQueue::Uninitialized),
                 metrics: Arc::new(RemoteTimelineClientMetrics::new(
                     &harness.tenant_id,
                     &TIMELINE_ID,
                 )),
             });
+
+            let deletion_queue = MockDeletionQueue::new(Some(storage), harness.conf);
 
             Ok(Self {
                 runtime,
@@ -1435,6 +1435,7 @@ mod tests {
                 tenant_ctx: ctx,
                 remote_fs_dir,
                 client,
+                deletion_queue,
             })
         }
     }
@@ -1464,6 +1465,7 @@ mod tests {
             tenant_ctx: _tenant_ctx,
             remote_fs_dir,
             client,
+            deletion_queue,
         } = TestSetup::new("upload_scheduling").unwrap();
 
         let timeline_path = harness.timeline_path(&TIMELINE_ID);
@@ -1558,18 +1560,14 @@ mod tests {
             &layer_file_name_3,
             &LayerFileMetadata::new(content_baz.len() as u64),
         )?;
-        client.schedule_layer_file_deletion(&[layer_file_name_1.clone()])?;
+
         {
             let mut guard = client.upload_queue.lock().unwrap();
             let upload_queue = guard.initialized_mut().unwrap();
-
-            // Deletion schedules upload of the index file, and the file deletion itself
-            assert!(upload_queue.queued_operations.len() == 2);
-            assert!(upload_queue.inprogress_tasks.len() == 1);
-            assert!(upload_queue.num_inprogress_layer_uploads == 1);
-            assert!(upload_queue.num_inprogress_deletions == 0);
-            assert!(upload_queue.latest_files_changes_since_metadata_upload_scheduled == 0);
+            assert_eq!(upload_queue.queued_operations.len(), 0);
+            assert_eq!(upload_queue.num_inprogress_layer_uploads, 1);
         }
+
         assert_remote_files(
             &[
                 &layer_file_name_1.file_name(),
@@ -1579,8 +1577,44 @@ mod tests {
             &remote_timeline_dir,
         );
 
-        // Finish them
+        runtime.block_on(client.schedule_layer_file_deletion(
+            &[layer_file_name_1.clone()],
+            &deletion_queue.new_client(),
+        ))?;
+
+        {
+            let mut guard = client.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut().unwrap();
+
+            // Deletion schedules upload of the index file via RemoteTimelineClient, and
+            // deletion of layer files via DeletionQueue.  The uploads have all been flushed
+            // because schedule_layer_file_deletion does a wait_completion before pushing
+            // to the deletion_queue
+            assert_eq!(upload_queue.queued_operations.len(), 0);
+            assert_eq!(upload_queue.inprogress_tasks.len(), 0);
+            assert_eq!(upload_queue.num_inprogress_layer_uploads, 0);
+            assert_eq!(upload_queue.num_inprogress_deletions, 0);
+            assert_eq!(
+                upload_queue.latest_files_changes_since_metadata_upload_scheduled,
+                0
+            );
+        }
+        assert_remote_files(
+            &[
+                &layer_file_name_1.file_name(),
+                &layer_file_name_2.file_name(),
+                &layer_file_name_3.file_name(),
+                "index_part.json",
+            ],
+            &remote_timeline_dir,
+        );
+
+        // Finish uploads and deletions
         runtime.block_on(client.wait_completion())?;
+        runtime.block_on(deletion_queue.pump());
+
+        // 1 layer was deleted
+        assert_eq!(deletion_queue.get_executed(), 1);
 
         assert_remote_files(
             &[

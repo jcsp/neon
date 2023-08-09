@@ -3922,7 +3922,13 @@ impl Timeline {
 
         // Also schedule the deletions in remote storage
         if let Some(remote_client) = &self.remote_client {
-            remote_client.schedule_layer_file_deletion(&layer_names_to_delete)?;
+            let deletion_queue = self
+                .deletion_queue_client
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Remote storage enabled without deletion queue"))?;
+            remote_client
+                .schedule_layer_file_deletion(&layer_names_to_delete, deletion_queue)
+                .await?;
         }
 
         Ok(())
@@ -4256,7 +4262,15 @@ impl Timeline {
             }
 
             if let Some(remote_client) = &self.remote_client {
-                remote_client.schedule_layer_file_deletion(&layer_names_to_delete)?;
+                // Remote metadata upload was scheduled in `update_metadata_file`: wait
+                // for completion before scheduling any deletions.
+                remote_client.wait_completion().await?;
+                let deletion_queue = self.deletion_queue_client.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Remote storage enabled without deletion queue")
+                })?;
+                remote_client
+                    .schedule_layer_file_deletion(&layer_names_to_delete, deletion_queue)
+                    .await?;
             }
 
             apply.flush();
@@ -4844,7 +4858,7 @@ mod tests {
 
     use utils::{id::TimelineId, lsn::Lsn};
 
-    use crate::deletion_queue::DeletionQueue;
+    use crate::deletion_queue::mock::MockDeletionQueue;
     use crate::tenant::{harness::TenantHarness, storage_layer::PersistentLayer};
 
     use super::{EvictionError, Timeline};
@@ -4867,11 +4881,15 @@ mod tests {
             };
             GenericRemoteStorage::from_config(&config).unwrap()
         };
-        let deletion_queue = DeletionQueue::new_mock();
+        let deletion_queue = MockDeletionQueue::new(Some(remote_storage.clone()), harness.conf);
 
         let ctx = any_context();
         let tenant = harness
-            .try_load(&ctx, Some(remote_storage), Some(&deletion_queue))
+            .try_load(
+                &ctx,
+                Some(remote_storage),
+                Some(deletion_queue.new_client()),
+            )
             .await
             .unwrap();
         let timeline = tenant
@@ -4936,11 +4954,15 @@ mod tests {
             };
             GenericRemoteStorage::from_config(&config).unwrap()
         };
-        let deletion_queue = DeletionQueue::new_mock();
+        let deletion_queue = MockDeletionQueue::new(Some(remote_storage.clone()), harness.conf);
 
         let ctx = any_context();
         let tenant = harness
-            .try_load(&ctx, Some(remote_storage), Some(&deletion_queue))
+            .try_load(
+                &ctx,
+                Some(remote_storage),
+                Some(deletion_queue.new_client()),
+            )
             .await
             .unwrap();
         let timeline = tenant
