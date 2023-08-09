@@ -1,5 +1,7 @@
-use remote_storage::{GenericRemoteStorage, RemotePath};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use remote_storage::GenericRemoteStorage;
+use tokio;
+use tracing::{self, debug, error, info};
+use utils::id::{TenantId, TimelineId};
 
 use crate::{config::PageServerConf, tenant::storage_layer::LayerFileName};
 
@@ -12,19 +14,125 @@ use crate::{config::PageServerConf, tenant::storage_layer::LayerFileName};
 ///
 /// DeletionQueue is the frontend that the rest of the pageserver interacts with.
 pub struct DeletionQueue {
-    tx: Sender<DeletionOp>,
+    tx: tokio::sync::mpsc::Sender<QueueMessage>,
 }
+
+enum QueueMessage {
+    Delete(DeletionOp),
+    Flush(FlushOp),
+}
+
 struct DeletionOp {
     tenant_id: TenantId,
     timeline_id: TimelineId,
     layers: Vec<LayerFileName>,
 }
+
+struct FlushOp {
+    tx: tokio::sync::oneshot::Sender<()>,
+}
+
 pub struct DeletionQueueClient {
-    tx: Sender<DeletionOp>,
+    tx: tokio::sync::mpsc::Sender<QueueMessage>,
 }
 
 impl DeletionQueueClient {
-    pub async fn push(tenant_id: TenantId, timeline_id: TimelineId, layers: Vec<LayerFileName>) {}
+    async fn do_push(&self, msg: QueueMessage) {
+        match self.tx.send(msg).await {
+            Ok(_) => {}
+            Err(e) => {
+                // This shouldn't happen, we should shut down all tenants before
+                // we shut down the global delete queue.  If we encounter a bug like this,
+                // we may leak objects as deletions won't be processed.
+                error!("Deletion queue closed while pushing, shutting down? ({e})");
+            }
+        }
+    }
+
+    pub async fn push(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        layers: Vec<LayerFileName>,
+    ) {
+        self.do_push(QueueMessage::Delete(DeletionOp {
+            tenant_id,
+            timeline_id,
+            layers,
+        }))
+        .await;
+    }
+
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.do_push(QueueMessage::Flush(FlushOp { tx })).await;
+        if let Err(_) = rx.await {
+            // This shouldn't happen if tenants are shut down before deletion queue.  If we
+            // encounter a bug like this, then a flusher will incorrectly believe it has flushed
+            // when it hasn't, possibly leading to leaking objects.
+            error!("Deletion queue dropped flush op while client was still waiting");
+        }
+    }
+}
+
+// TODO: metrics for queue length, deletions executed, deletion errors
+
+pub struct DeletionQueueWorker {
+    remote_storage: Option<GenericRemoteStorage>,
+    conf: &'static PageServerConf,
+    rx: tokio::sync::mpsc::Receiver<QueueMessage>,
+}
+
+impl DeletionQueueWorker {
+    pub async fn background(&mut self) {
+        let remote_storage = match &self.remote_storage {
+            Some(rs) => rs,
+            None => {
+                info!("No remote storage configured, deletion queue will not run");
+                return;
+            }
+        };
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                QueueMessage::Delete(op) => {
+                    let timeline_path = self.conf.timeline_path(&op.tenant_id, &op.timeline_id);
+
+                    let _span = tracing::info_span!(
+                        "execute_deletion",
+                        tenant_id = %op.tenant_id,
+                        timeline_id = %op.timeline_id,
+                    );
+
+                    for layer in op.layers {
+                        // TODO go directly to remote path without composing local path
+                        let local_path = timeline_path.join(layer.file_name());
+                        let path = match self.conf.remote_path(&local_path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                panic!("Can't make a timeline path! {e}");
+                            }
+                        };
+                        match remote_storage.delete(&path).await {
+                            Ok(_) => {
+                                debug!("Deleted {path}");
+                            }
+                            Err(e) => {
+                                // TODO: we should persist delete queue before attempting deletion, and then retry later.
+                                error!("Failed to delete {path}, leaking object! ({e})");
+                            }
+                        }
+                    }
+                }
+                QueueMessage::Flush(op) => {
+                    if let Err(_) = op.tx.send(()) {
+                        // oneshot channel closed. This is legal: a client could be destroyed while waiting for a flush.
+                        debug!("deletion queue flush from dropped client");
+                    };
+                }
+            }
+        }
+        info!("Deletion queue shut down.");
+    }
 }
 
 impl DeletionQueue {
@@ -34,40 +142,19 @@ impl DeletionQueue {
         }
     }
 
-    fn consume_loop(
-        remote_storage: GenericRemoteStorage,
+    pub fn new(
+        remote_storage: Option<GenericRemoteStorage>,
         conf: &'static PageServerConf,
-        rx: Receiver<DeletionOp>,
-    ) {
-        while let Some(op) = rx.recv().await {
-            let timeline_path = self.conf.timeline_path(&op.tenant_id, &op.timeline_id);
-            let timeline_storage_path = conf.remote_path(&timeline_path)?;
+    ) -> (Self, DeletionQueueWorker) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16384);
 
-            let span = tracing::info_span(
-                "deletion",
-                tenant_id = op.tenant_id,
-                timeline_id = op.timeline_id,
-            );
-
-            for layer in op.layers {
-                let path = timeline_storage_path.join(layer.file_name());
-                match remote_storage.delete(&path).await {
-                    Ok() => {
-                        debug!("Deleted {path}");
-                    }
-                    Err(e) => {
-                        error!("Failed to delete {path}, leaking object!");
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn new(remote_storage: GenericRemoteStorage, conf: &'static PageServerConf) -> Self {
-        let (tx, rx) = channel::new(16384);
-
-        tokio::spawn(async move { consume_loop(remote_storage, conf, rx).await });
-
-        Self { tx }
+        (
+            Self { tx },
+            DeletionQueueWorker {
+                remote_storage,
+                conf,
+                rx,
+            },
+        )
     }
 }
