@@ -166,7 +166,7 @@ impl Generation {
 
     // TODO: remove this function once generation initialization
     // from the control plane is in place.
-    fn placeholder() -> Self {
+    pub fn placeholder() -> Self {
         Self(Self::PLACEHOLDER)
     }
 
@@ -174,8 +174,7 @@ impl Generation {
         self.0 == Self::PLACEHOLDER
     }
 
-    #[cfg(test)]
-    fn new(v: u32) -> Self {
+    pub fn new(v: u32) -> Self {
         assert!(v != Self::BROKEN);
 
         Self(v)
