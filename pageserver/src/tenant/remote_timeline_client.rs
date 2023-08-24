@@ -216,7 +216,7 @@ use utils::backoff::{
 };
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -234,6 +234,7 @@ use crate::metrics::{
 use crate::tenant::debug_assert_current_span_has_tenant_and_timeline_id;
 use crate::tenant::remote_timeline_client::index::LayerFileMetadata;
 use crate::tenant::upload_queue::Delete;
+use crate::tenant::TIMELINES_SEGMENT_NAME;
 use crate::{
     config::PageServerConf,
     task_mgr,
@@ -451,6 +452,7 @@ impl RemoteTimelineClient {
             &self.storage_impl,
             &self.tenant_id,
             &self.timeline_id,
+            self.generation,
         )
         .measure_remote_op(
             self.tenant_id,
@@ -760,7 +762,6 @@ impl RemoteTimelineClient {
         backoff::retry(
             || async {
                 upload::upload_index_part(
-                    self.conf,
                     &self.storage_impl,
                     &self.tenant_id,
                     &self.timeline_id,
@@ -849,8 +850,7 @@ impl RemoteTimelineClient {
 
         // Do not delete index part yet, it is needed for possible retry. If we remove it first
         // and retry will arrive to different pageserver there wont be any traces of it on remote storage
-        let timeline_path = self.conf.timeline_path(&self.tenant_id, &self.timeline_id);
-        let timeline_storage_path = self.conf.remote_path(&timeline_path)?;
+        let timeline_storage_path = remote_timeline_path(&self.tenant_id, &self.timeline_id);
 
         let remaining = backoff::retry(
             || async {
@@ -1067,6 +1067,7 @@ impl RemoteTimelineClient {
                         &self.storage_impl,
                         &path,
                         layer_metadata,
+                        self.generation,
                     )
                     .measure_remote_op(
                         self.tenant_id,
@@ -1079,7 +1080,6 @@ impl RemoteTimelineClient {
                 }
                 UploadOp::UploadMetadata(ref index_part, _lsn) => {
                     let res = upload::upload_index_part(
-                        self.conf,
                         &self.storage_impl,
                         &self.tenant_id,
                         &self.timeline_id,
@@ -1350,6 +1350,73 @@ impl RemoteTimelineClient {
             }
         }
     }
+}
+
+pub fn remote_timelines_path(tenant_id: &TenantId) -> RemotePath {
+    let path = format!("tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}");
+    RemotePath::from_string(&path).expect("Failed to construct path")
+}
+
+pub fn remote_timeline_path(tenant_id: &TenantId, timeline_id: &TimelineId) -> RemotePath {
+    remote_timelines_path(tenant_id).join(&PathBuf::from(timeline_id.to_string()))
+}
+
+pub fn remote_layer_path(
+    tenant_id: &TenantId,
+    timeline_id: &TimelineId,
+    layer_file_name: &LayerFileName,
+    layer_meta: &LayerFileMetadata,
+) -> RemotePath {
+    let path = if let Some(generation) = layer_meta.generation {
+        // Generation-aware key format
+        format!(
+            "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}/{1}",
+            layer_file_name.file_name(),
+            generation
+        )
+    } else {
+        // Pre-generation key format
+        format!(
+            "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}",
+            layer_file_name.file_name(),
+        )
+    };
+
+    RemotePath::from_string(&path).expect("Failed to construct path")
+}
+
+pub fn remote_index_path(
+    tenant_id: &TenantId,
+    timeline_id: &TimelineId,
+    generation: Generation,
+) -> RemotePath {
+    RemotePath::from_string(&format!(
+        "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}",
+        IndexPart::FILE_NAME
+    ))
+    .expect("Failed to construct path")
+    .join(&generation.get_suffix())
+}
+
+/// Files on the remote storage are stored with paths, relative to the workdir.
+/// That path includes in itself both tenant and timeline ids, allowing to have a unique remote storage path.
+///
+/// Errors if the path provided does not start from pageserver's workdir.
+pub fn remote_path(
+    conf: &PageServerConf,
+    local_path: &Path,
+    generation: Generation,
+) -> anyhow::Result<RemotePath> {
+    local_path
+        .strip_prefix(&conf.workdir)
+        .context("Failed to strip workdir prefix")
+        .and_then(|p| RemotePath::new(&p.join(generation.get_suffix())))
+        .with_context(|| {
+            format!(
+                "Failed to resolve remote part of path {:?} for base {:?}",
+                local_path, conf.workdir
+            )
+        })
 }
 
 #[cfg(test)]
