@@ -5,6 +5,7 @@ use fail::fail_point;
 use std::{io::ErrorKind, path::Path};
 use tokio::fs;
 
+use super::Generation;
 use crate::{config::PageServerConf, tenant::remote_timeline_client::index::IndexPart};
 use remote_storage::GenericRemoteStorage;
 use utils::id::{TenantId, TimelineId};
@@ -19,6 +20,7 @@ pub(super) async fn upload_index_part<'a>(
     storage: &'a GenericRemoteStorage,
     tenant_id: &TenantId,
     timeline_id: &TimelineId,
+    generation: Generation,
     index_part: &'a IndexPart,
 ) -> anyhow::Result<()> {
     tracing::trace!("uploading new index part");
@@ -34,7 +36,9 @@ pub(super) async fn upload_index_part<'a>(
 
     let index_part_path = conf
         .metadata_path(tenant_id, timeline_id)
-        .with_file_name(IndexPart::FILE_NAME);
+        .with_file_name(IndexPart::FILE_NAME)
+        .join(generation.get_suffix());
+
     let storage_path = conf.remote_path(&index_part_path)?;
 
     storage

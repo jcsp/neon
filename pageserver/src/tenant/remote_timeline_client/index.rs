@@ -26,7 +26,7 @@ pub struct LayerFileMetadata {
     file_size: u64,
 
     // Optional for backward compatibility: older data will not have a generation set
-    generation: Option<Generation>,
+    pub(crate) generation: Option<Generation>,
 }
 
 impl From<&'_ IndexLayerMetadata> for LayerFileMetadata {
@@ -144,13 +144,17 @@ impl TryFrom<&UploadQueueInitialized> for IndexPart {
     }
 }
 
+fn generation_is_placeholder_or_none(g: &Option<Generation>) -> bool {
+    g.map(|g| g.is_placeholder()).unwrap_or(true)
+}
+
 /// Serialized form of [`LayerFileMetadata`].
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
 pub struct IndexLayerMetadata {
     pub(super) file_size: u64,
 
     #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "generation_is_placeholder_or_none")]
     pub(super) generation: Option<Generation>,
 }
 

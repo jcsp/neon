@@ -251,6 +251,7 @@ use self::index::IndexPart;
 
 use super::storage_layer::LayerFileName;
 use super::upload_queue::SetDeletedFlagProgress;
+use super::Generation;
 
 // Occasional network issues and such can cause remote operations to fail, and
 // that's expected. If a download fails, we log it at info-level, and retry.
@@ -314,6 +315,7 @@ pub struct RemoteTimelineClient {
 
     tenant_id: TenantId,
     timeline_id: TimelineId,
+    generation: Generation,
 
     upload_queue: Mutex<UploadQueue>,
 
@@ -334,12 +336,14 @@ impl RemoteTimelineClient {
         conf: &'static PageServerConf,
         tenant_id: TenantId,
         timeline_id: TimelineId,
+        generation: Generation,
     ) -> RemoteTimelineClient {
         RemoteTimelineClient {
             conf,
             runtime: BACKGROUND_RUNTIME.handle().to_owned(),
             tenant_id,
             timeline_id,
+            generation,
             storage_impl: remote_storage,
             upload_queue: Mutex::new(UploadQueue::Uninitialized),
             metrics: Arc::new(RemoteTimelineClientMetrics::new(&tenant_id, &timeline_id)),
@@ -760,6 +764,7 @@ impl RemoteTimelineClient {
                     &self.storage_impl,
                     &self.tenant_id,
                     &self.timeline_id,
+                    self.generation,
                     &index_part_with_deleted_at,
                 )
                 .await
@@ -1046,14 +1051,21 @@ impl RemoteTimelineClient {
 
             let upload_result: anyhow::Result<()> = match &task.op {
                 UploadOp::UploadLayer(ref layer_file_name, ref layer_metadata) => {
-                    let path = &self
+                    let mut path = self
                         .conf
                         .timeline_path(&self.tenant_id, &self.timeline_id)
                         .join(layer_file_name.file_name());
+
+                    if let Some(generation) = layer_metadata.generation {
+                        // TODO: refactor LayerMetadata to just describe local layer state,
+                        // then get RemoteTimelineClient to pass in the generation
+                        path = path.join(&generation.get_suffix());
+                    }
+
                     upload::upload_timeline_layer(
                         self.conf,
                         &self.storage_impl,
-                        path,
+                        &path,
                         layer_metadata,
                     )
                     .measure_remote_op(
@@ -1071,6 +1083,7 @@ impl RemoteTimelineClient {
                         &self.storage_impl,
                         &self.tenant_id,
                         &self.timeline_id,
+                        self.generation,
                         index_part,
                     )
                     .measure_remote_op(
@@ -1440,6 +1453,8 @@ mod tests {
                 storage: RemoteStorageKind::LocalFs(remote_fs_dir.clone()),
             };
 
+            let generation = Generation::new(0xdeadbeef);
+
             let storage = GenericRemoteStorage::from_config(&storage_config).unwrap();
 
             let client = Arc::new(RemoteTimelineClient {
@@ -1447,6 +1462,7 @@ mod tests {
                 runtime: tokio::runtime::Handle::current(),
                 tenant_id: harness.tenant_id,
                 timeline_id: TIMELINE_ID,
+                generation: generation,
                 storage_impl: storage,
                 upload_queue: Mutex::new(UploadQueue::Uninitialized),
                 metrics: Arc::new(RemoteTimelineClientMetrics::new(

@@ -158,10 +158,20 @@ pub struct Generation(u32);
 impl Generation {
     const BROKEN: u32 = u32::MAX;
 
+    // Generations with this magic value will not add a suffix to S3 keys, and will not
+    // be included in persisted index_part.json.  This is for the initial version of
+    // generation-aware code that will decode generations from indices + keys, but
+    // not write them.
+    const PLACEHOLDER: u32 = u32::MAX - 1;
+
     // TODO: remove this function once generation initialization
     // from the control plane is in place.
     fn placeholder() -> Self {
-        Self(0xdeadbeef)
+        Self(Self::PLACEHOLDER)
+    }
+
+    fn is_placeholder(&self) -> bool {
+        self.0 == Self::PLACEHOLDER
     }
 
     #[cfg(test)]
@@ -178,6 +188,18 @@ impl Generation {
         Self(Self::BROKEN)
     }
 
+    fn get_suffix(&self) -> PathBuf {
+        // This is a panic, because it should never happen: this would happen
+        // if someone had e.g. constructed a tenant in a broken state, and then
+        // tried to use its remote storage.
+        assert!(self.0 != Self::BROKEN, "Tried to use a broken generation");
+        if self.0 == Self::PLACEHOLDER {
+            "".into()
+        } else {
+            format!("-{:08x}", self.0).into()
+        }
+    }
+
     // fn get(&self) -> u32 {
     //     // This is a panic, because it should never happen: this would happen
     //     // if someone had e.g. constructed a tenant in a broken state, and then
@@ -190,7 +212,13 @@ impl Generation {
 
 impl Display for Generation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:08x}", self.0)
+        if self.0 == Self::BROKEN {
+            write!(f, "<broken>")
+        } else if self.0 == Self::PLACEHOLDER {
+            write!(f, "<none>")
+        } else {
+            write!(f, "{:08x}", self.0)
+        }
     }
 }
 
@@ -700,6 +728,7 @@ impl Tenant {
                 self.conf,
                 self.tenant_id,
                 timeline_id,
+                self.generation,
             );
             part_downloads.spawn(
                 async move {
@@ -2978,6 +3007,7 @@ impl Tenant {
                 self.conf,
                 self.tenant_id,
                 timeline_id,
+                self.generation,
             );
             Some(remote_client)
         } else {
