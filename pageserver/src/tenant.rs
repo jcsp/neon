@@ -187,7 +187,7 @@ impl Generation {
         Self(Self::BROKEN)
     }
 
-    fn get_suffix(&self) -> PathBuf {
+    fn get_suffix(&self) -> String {
         // This is a panic, because it should never happen: this would happen
         // if someone had e.g. constructed a tenant in a broken state, and then
         // tried to use its remote storage.
@@ -212,9 +212,9 @@ impl Generation {
 impl Display for Generation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0 == Self::BROKEN {
-            write!(f, "<broken>")
+            write!(f, "broken")
         } else if self.0 == Self::PLACEHOLDER {
-            write!(f, "<none>")
+            write!(f, "none")
         } else {
             write!(f, "{:08x}", self.0)
         }

@@ -1056,12 +1056,6 @@ impl RemoteTimelineClient {
                         .timeline_path(&self.tenant_id, &self.timeline_id)
                         .join(layer_file_name.file_name());
 
-                    if let Some(generation) = layer_metadata.generation {
-                        // TODO: refactor LayerMetadata to just describe local layer state,
-                        // then get RemoteTimelineClient to pass in the generation
-                        path = path.join(&generation.get_suffix());
-                    }
-
                     upload::upload_timeline_layer(
                         self.conf,
                         &self.storage_impl,
@@ -1370,9 +1364,9 @@ pub fn remote_layer_path(
     let path = if let Some(generation) = layer_meta.generation {
         // Generation-aware key format
         format!(
-            "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}/{1}",
+            "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}{1}",
             layer_file_name.file_name(),
-            generation
+            generation.get_suffix()
         )
     } else {
         // Pre-generation key format
@@ -1391,11 +1385,11 @@ pub fn remote_index_path(
     generation: Generation,
 ) -> RemotePath {
     RemotePath::from_string(&format!(
-        "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}",
-        IndexPart::FILE_NAME
+        "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{0}{1}",
+        IndexPart::FILE_NAME,
+        generation.get_suffix()
     ))
     .expect("Failed to construct path")
-    .join(&generation.get_suffix())
 }
 
 /// Files on the remote storage are stored with paths, relative to the workdir.
@@ -1407,16 +1401,22 @@ pub fn remote_path(
     local_path: &Path,
     generation: Generation,
 ) -> anyhow::Result<RemotePath> {
-    local_path
+    let stripped = local_path
         .strip_prefix(&conf.workdir)
-        .context("Failed to strip workdir prefix")
-        .and_then(|p| RemotePath::new(&p.join(generation.get_suffix())))
-        .with_context(|| {
-            format!(
-                "Failed to resolve remote part of path {:?} for base {:?}",
-                local_path, conf.workdir
-            )
-        })
+        .context("Failed to strip workdir prefix")?;
+
+    let suffixed = format!(
+        "{0}{1}",
+        stripped.to_string_lossy(),
+        generation.get_suffix()
+    );
+
+    RemotePath::new(&PathBuf::from(suffixed)).with_context(|| {
+        format!(
+            "Failed to resolve remote part of path {:?} for base {:?}",
+            local_path, conf.workdir
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1468,8 +1468,11 @@ mod tests {
         assert_eq!(avec, bvec);
     }
 
-    fn assert_remote_files(expected: &[&str], remote_path: &Path) {
-        let mut expected: Vec<String> = expected.iter().map(|x| String::from(*x)).collect();
+    fn assert_remote_files(expected: &[&str], remote_path: &Path, generation: Generation) {
+        let mut expected: Vec<String> = expected
+            .iter()
+            .map(|x| format!("{}{}", x, generation.get_suffix()))
+            .collect();
         expected.sort();
 
         let mut found: Vec<String> = Vec::new();
@@ -1588,6 +1591,8 @@ mod tests {
             .init_upload_queue_for_empty_remote(&metadata)
             .unwrap();
 
+        let generation = Generation::new(0xdeadbeef);
+
         // Create a couple of dummy files,  schedule upload for them
         let layer_file_name_1: LayerFileName = "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap();
         let layer_file_name_2: LayerFileName = "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D9-00000000016B5A52".parse().unwrap();
@@ -1603,8 +1608,6 @@ mod tests {
         ] {
             std::fs::write(timeline_path.join(filename.file_name()), content).unwrap();
         }
-
-        let generation = Generation::new(0xdeadbeef);
 
         client
             .schedule_layer_file_upload(
@@ -1704,6 +1707,7 @@ mod tests {
                 "index_part.json",
             ],
             &remote_timeline_dir,
+            generation,
         );
 
         // Finish them
@@ -1716,6 +1720,7 @@ mod tests {
                 "index_part.json",
             ],
             &remote_timeline_dir,
+            generation,
         );
     }
 
