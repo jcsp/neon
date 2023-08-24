@@ -1,6 +1,7 @@
 use crate::metrics::RemoteOpFileKind;
 
 use super::storage_layer::LayerFileName;
+use super::Generation;
 use crate::tenant::metadata::TimelineMetadata;
 use crate::tenant::remote_timeline_client::index::IndexPart;
 use crate::tenant::remote_timeline_client::index::LayerFileMetadata;
@@ -206,6 +207,7 @@ pub(crate) struct Delete {
     pub(crate) file_kind: RemoteOpFileKind,
     pub(crate) layer_file_name: LayerFileName,
     pub(crate) scheduled_from_timeline_delete: bool,
+    pub(crate) generation: Option<Generation>,
 }
 
 #[derive(Debug)]
@@ -239,9 +241,10 @@ impl std::fmt::Display for UploadOp {
             }
             UploadOp::Delete(delete) => write!(
                 f,
-                "Delete(path: {}, scheduled_from_timeline_delete: {})",
+                "Delete(path: {}, scheduled_from_timeline_delete: {}, gen: {})",
                 delete.layer_file_name.file_name(),
-                delete.scheduled_from_timeline_delete
+                delete.scheduled_from_timeline_delete,
+                delete.generation.unwrap_or(Generation::placeholder())
             ),
             UploadOp::Barrier(_) => write!(f, "Barrier"),
         }
