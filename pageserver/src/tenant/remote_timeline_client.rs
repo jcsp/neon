@@ -1346,7 +1346,7 @@ mod tests {
         context::RequestContext,
         tenant::{
             harness::{TenantHarness, TIMELINE_ID},
-            Tenant, Timeline,
+            Generation, Tenant, Timeline,
         },
         DEFAULT_PG_VERSION,
     };
@@ -1521,16 +1521,18 @@ mod tests {
             std::fs::write(timeline_path.join(filename.file_name()), content).unwrap();
         }
 
+        let generation = Generation::new(0xdeadbeef);
+
         client
             .schedule_layer_file_upload(
                 &layer_file_name_1,
-                &LayerFileMetadata::new(content_1.len() as u64),
+                &LayerFileMetadata::new(content_1.len() as u64, generation),
             )
             .unwrap();
         client
             .schedule_layer_file_upload(
                 &layer_file_name_2,
-                &LayerFileMetadata::new(content_2.len() as u64),
+                &LayerFileMetadata::new(content_2.len() as u64, generation),
             )
             .unwrap();
 
@@ -1595,7 +1597,7 @@ mod tests {
         client
             .schedule_layer_file_upload(
                 &layer_file_name_3,
-                &LayerFileMetadata::new(content_3.len() as u64),
+                &LayerFileMetadata::new(content_3.len() as u64, generation),
             )
             .unwrap();
         client
@@ -1683,12 +1685,14 @@ mod tests {
 
         // Test
 
+        let generation = Generation::new(0xdeadbeef);
+
         let init = get_bytes_started_stopped();
 
         client
             .schedule_layer_file_upload(
                 &layer_file_name_1,
-                &LayerFileMetadata::new(content_1.len() as u64),
+                &LayerFileMetadata::new(content_1.len() as u64, generation),
             )
             .unwrap();
 

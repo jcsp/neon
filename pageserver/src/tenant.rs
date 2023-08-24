@@ -16,6 +16,8 @@ use futures::FutureExt;
 use pageserver_api::models::TimelineState;
 use remote_storage::DownloadError;
 use remote_storage::GenericRemoteStorage;
+use serde::Deserialize;
+use serde::Serialize;
 use storage_broker::BrokerClientChannel;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -150,6 +152,48 @@ pub const TENANT_ATTACHING_MARKER_FILENAME: &str = "attaching";
 
 pub const TENANT_DELETED_MARKER_FILE_NAME: &str = "deleted";
 
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub struct Generation(u32);
+
+impl Generation {
+    const BROKEN: u32 = u32::MAX;
+
+    // TODO: remove this function once generation initialization
+    // from the control plane is in place.
+    fn placeholder() -> Self {
+        Self(0xdeadbeef)
+    }
+
+    #[cfg(test)]
+    fn new(v: u32) -> Self {
+        assert!(v != Self::BROKEN);
+
+        Self(v)
+    }
+
+    // If you need to construct a Tenant in an unusable broken state, give
+    // it this kind of Generation to satisfy the interface.  It will panic
+    // if you mistakenly try and use it for any I/O.
+    fn broken() -> Self {
+        Self(Self::BROKEN)
+    }
+
+    // fn get(&self) -> u32 {
+    //     // This is a panic, because it should never happen: this would happen
+    //     // if someone had e.g. constructed a tenant in a broken state, and then
+    //     // tried to use its remote storage.
+    //     assert!(self.0 != Self::BROKEN, "Tried to use a broken generation");
+
+    //     self.0
+    // }
+}
+
+impl Display for Generation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
+}
+
 /// References to shared objects that are passed into each tenant, such
 /// as the shared remote storage client and process initialization state.
 #[derive(Clone)]
@@ -178,6 +222,10 @@ pub struct Tenant {
     tenant_conf: Arc<RwLock<TenantConfOpt>>,
 
     tenant_id: TenantId,
+
+    // The remote storage generation, used to protect S3 objects from split-brain
+    generation: Generation,
+
     timelines: Mutex<HashMap<TimelineId, Arc<Timeline>>>,
     // This mutex prevents creation of new timelines during GC.
     // Adding yet another mutex (in addition to `timelines`) is needed because holding
@@ -507,6 +555,7 @@ impl Tenant {
     pub(crate) fn spawn_attach(
         conf: &'static PageServerConf,
         tenant_id: TenantId,
+        generation: Generation,
         broker_client: storage_broker::BrokerClientChannel,
         tenants: &'static tokio::sync::RwLock<TenantsMap>,
         remote_storage: GenericRemoteStorage,
@@ -523,6 +572,7 @@ impl Tenant {
             tenant_conf,
             wal_redo_manager,
             tenant_id,
+            generation,
             Some(remote_storage.clone()),
         ));
 
@@ -839,6 +889,7 @@ impl Tenant {
             TenantConfOpt::default(),
             wal_redo_manager,
             tenant_id,
+            Generation::broken(),
             None,
         ))
     }
@@ -856,6 +907,7 @@ impl Tenant {
     pub(crate) fn spawn_load(
         conf: &'static PageServerConf,
         tenant_id: TenantId,
+        generation: Generation,
         resources: TenantSharedResources,
         init_order: Option<InitializationOrder>,
         tenants: &'static tokio::sync::RwLock<TenantsMap>,
@@ -881,6 +933,7 @@ impl Tenant {
             tenant_conf,
             wal_redo_manager,
             tenant_id,
+            generation,
             remote_storage.clone(),
         );
         let tenant = Arc::new(tenant);
@@ -2265,6 +2318,7 @@ impl Tenant {
             ancestor,
             new_timeline_id,
             self.tenant_id,
+            self.generation,
             Arc::clone(&self.walredo_mgr),
             resources,
             pg_version,
@@ -2282,6 +2336,7 @@ impl Tenant {
         tenant_conf: TenantConfOpt,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
         tenant_id: TenantId,
+        generation: Generation,
         remote_storage: Option<GenericRemoteStorage>,
     ) -> Tenant {
         let (state, mut rx) = watch::channel(state);
@@ -2340,6 +2395,7 @@ impl Tenant {
 
         Tenant {
             tenant_id,
+            generation,
             conf,
             // using now here is good enough approximation to catch tenants with really long
             // activation times.
@@ -3445,6 +3501,7 @@ pub mod harness {
         pub conf: &'static PageServerConf,
         pub tenant_conf: TenantConf,
         pub tenant_id: TenantId,
+        pub generation: Generation,
     }
 
     static LOG_HANDLE: OnceCell<()> = OnceCell::new();
@@ -3486,6 +3543,7 @@ pub mod harness {
                 conf,
                 tenant_conf,
                 tenant_id,
+                generation: Generation::new(0xdeadbeef),
             })
         }
 
@@ -3512,6 +3570,7 @@ pub mod harness {
                 TenantConfOpt::from(self.tenant_conf),
                 walredo_mgr,
                 self.tenant_id,
+                self.generation,
                 remote_storage,
             ));
             tenant

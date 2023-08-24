@@ -21,7 +21,7 @@ use crate::context::{DownloadBehavior, RequestContext};
 use crate::task_mgr::{self, TaskKind};
 use crate::tenant::config::TenantConfOpt;
 use crate::tenant::delete::DeleteTenantFlow;
-use crate::tenant::{create_tenant_files, CreateTenantFilesMode, Tenant, TenantState};
+use crate::tenant::{create_tenant_files, CreateTenantFilesMode, Generation, Tenant, TenantState};
 use crate::{InitializationOrder, IGNORED_TENANT_FILE_NAME};
 
 use utils::fs_ext::PathExt;
@@ -202,6 +202,7 @@ pub(crate) fn schedule_local_tenant_processing(
             match Tenant::spawn_attach(
                 conf,
                 tenant_id,
+                Generation::placeholder(),
                 resources.broker_client,
                 tenants,
                 remote_storage,
@@ -224,7 +225,15 @@ pub(crate) fn schedule_local_tenant_processing(
     } else {
         info!("tenant {tenant_id} is assumed to be loadable, starting load operation");
         // Start loading the tenant into memory. It will initially be in Loading state.
-        Tenant::spawn_load(conf, tenant_id, resources, init_order, tenants, ctx)
+        Tenant::spawn_load(
+            conf,
+            tenant_id,
+            Generation::placeholder(),
+            resources,
+            init_order,
+            tenants,
+            ctx,
+        )
     };
     Ok(tenant)
 }
