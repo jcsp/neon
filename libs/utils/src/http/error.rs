@@ -2,7 +2,7 @@ use hyper::{header, Body, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -108,10 +108,21 @@ pub async fn route_error_handler(err: routerify::RouteError) -> Response<Body> {
 
 pub fn api_error_handler(api_error: ApiError) -> Response<Body> {
     // Print a stack trace for Internal Server errors
-    if let ApiError::InternalServerError(_) = api_error {
-        error!("Error processing HTTP request: {api_error:?}");
-    } else {
-        error!("Error processing HTTP request: {api_error:#}");
+    match &api_error {
+        ApiError::InternalServerError(_) => {
+            // An internal server error suggests a possible bug in the pageserver (or
+            // a case we should be handling more cleanly): log as an error.
+            error!("Error processing HTTP request: {api_error:?}");
+        }
+        ApiError::NotFound(_) | ApiError::ShuttingDown => {
+            // 404 and 503 responses are not server errors: log them at info level.
+            info!("HTTP request failed: {api_error:#}");
+        }
+        _ => {
+            // Things like BadRequest and authentication issues suggests a bug in another
+            // service, or a configuration problem in our deployment: log at warn level.
+            warn!("HTTP request failed: {api_error:#}");
+        }
     }
 
     api_error.into_response()
