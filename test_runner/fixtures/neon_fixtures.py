@@ -1785,7 +1785,7 @@ class NeonPageserver(PgProtocol):
         client = self.http_client()
         return client.tenant_detach(tenant_id)
 
-    def tenant_location_configure(self, tenant_id: TenantId, config: dict[str, Any]):
+    def tenant_location_configure(self, tenant_id: TenantId, config: dict[str, Any], **kwargs):
         # This API is only for use when generations are enabled
         assert self.env.attachment_service is not None
 
@@ -1793,7 +1793,7 @@ class NeonPageserver(PgProtocol):
             config["generation"] = self.env.attachment_service.attach_hook(tenant_id, self.id)
 
         client = self.http_client()
-        return client.tenant_location_conf(tenant_id, config)
+        return client.tenant_location_conf(tenant_id, config, **kwargs)
 
     def read_tenant_location_conf(self, tenant_id: TenantId) -> dict[str, Any]:
         path = self.tenant_dir(tenant_id) / "config-v1"
@@ -2711,6 +2711,7 @@ class EndpointFactory:
         lsn: Optional[Lsn] = None,
         hot_standby: bool = False,
         config_lines: Optional[List[str]] = None,
+        pageserver_id: Optional[int] = None,
     ) -> Endpoint:
         ep = Endpoint(
             self.env,
@@ -2730,6 +2731,7 @@ class EndpointFactory:
             lsn=lsn,
             hot_standby=hot_standby,
             config_lines=config_lines,
+            pageserver_id=pageserver_id,
         )
 
     def stop_all(self) -> "EndpointFactory":
