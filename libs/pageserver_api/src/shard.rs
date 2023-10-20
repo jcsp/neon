@@ -1,5 +1,6 @@
 use std::{ops::RangeInclusive, str::FromStr};
 
+use crate::key::Key;
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
 use utils::id::TenantId;
@@ -139,6 +140,75 @@ impl From<[u8; 18]> for TenantShardId {
     }
 }
 
+impl ShardNumber {}
+
+/// Stripe size in number of pages
+#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
+pub struct ShardStripeSize(pub u32);
+
+/// Layout version: for future upgrades where we might change how the key->shard mapping works
+#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
+pub struct ShardLayout(u8);
+
+const LAYOUT_V1: ShardLayout = ShardLayout(1);
+
+/// Default stripe size in pages: 256MiB divided by 8kiB page size.
+const DEFAULT_STRIPE_SIZE: ShardStripeSize = ShardStripeSize(256 * 1024 / 8);
+
+/// The ShardIdentity contains the information needed for one member of map
+/// to resolve a key to a shard, and then check whether that shard is ==self.
+#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
+pub struct ShardIdentity {
+    pub layout: ShardLayout,
+    pub number: ShardNumber,
+    pub count: ShardCount,
+    pub stripe_size: ShardStripeSize,
+}
+
+impl ShardIdentity {
+    /// An identity with number=0 count=0 is a "none" identity, which represents legacy
+    /// tenants.  Modern single-shard tenants should not use this: they should
+    /// have number=0 count=1.
+    pub fn none() -> Self {
+        Self {
+            number: ShardNumber(0),
+            count: ShardCount(0),
+            layout: LAYOUT_V1,
+            stripe_size: DEFAULT_STRIPE_SIZE,
+        }
+    }
+
+    pub fn new(number: ShardNumber, count: ShardCount, stripe_size: ShardStripeSize) -> Self {
+        Self {
+            number,
+            count,
+            layout: LAYOUT_V1,
+            stripe_size,
+        }
+    }
+
+    pub fn get_shard_number(&self, key: &Key) -> ShardNumber {
+        key_to_shard_number(self.count, self.stripe_size, key)
+    }
+
+    /// Return true if the key should be ingested by this shard
+    pub fn is_key_local(&self, key: &Key) -> bool {
+        if self.count < ShardCount(2) || key_is_broadcast(key) {
+            true
+        } else {
+            key_to_shard_number(self.count, self.stripe_size, key) == self.number
+        }
+    }
+
+    pub fn slug(&self) -> String {
+        if self.count > ShardCount(0) {
+            format!("-{:02x}{:02x}", self.number.0, self.count.0)
+        } else {
+            String::new()
+        }
+    }
+}
+
 impl Serialize for TenantShardId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -153,6 +223,19 @@ impl Serialize for TenantShardId {
             packed[17] = self.shard_count.0;
 
             packed.serialize(serializer)
+        }
+    }
+}
+
+impl Default for ShardIdentity {
+    /// The default identity is to be the only shard for a tenant, i.e. the legacy
+    /// pre-sharding case.
+    fn default() -> Self {
+        ShardIdentity {
+            layout: LAYOUT_V1,
+            number: ShardNumber(0),
+            count: ShardCount(1),
+            stripe_size: DEFAULT_STRIPE_SIZE,
         }
     }
 }
@@ -207,6 +290,65 @@ impl<'de> Deserialize<'de> for TenantShardId {
             )
         }
     }
+}
+
+fn key_is_broadcast(key: &Key) -> bool {
+    // TODO: deduplicate wrt pgdatadir_mapping.rs
+    fn is_rel_block_key(key: &Key) -> bool {
+        key.field1 == 0x00 && key.field4 != 0
+    }
+
+    // TODO: can we be less conservative?  Starting point is to broadcast everything
+    // except for rel block keys
+    !is_rel_block_key(key)
+}
+
+/// Provide the same result as the function in postgres `hashfn.h` with the same name
+fn murmurhash32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h
+}
+
+/// Provide the same result as the function in postgres `hashfn.h` with the same name
+fn hash_combine(mut a: u32, mut b: u32) -> u32 {
+    b = b.wrapping_add(0x9e3779b9);
+    b = b.wrapping_add(a << 6);
+    b = b.wrapping_add(a >> 2);
+
+    a ^= b;
+    a
+}
+
+/// Where a Key is to be distributed across shards, select the shard.  This function
+/// does not account for keys that should be broadcast across shards.
+///
+/// The hashing in this function must exactly match what we do in postgres smgr
+/// code.  The resulting distribution of pages is intended to preserve locality within
+/// `stripe_size` ranges of contiguous block numbers in the same relation, while otherwise
+/// distributing data pseudo-randomly.
+///
+/// The mapping of key to shard is not stable across changes to ShardCount: this is intentional
+/// and will be handled at higher levels when shards are split.
+fn key_to_shard_number(count: ShardCount, stripe_size: ShardStripeSize, key: &Key) -> ShardNumber {
+    // Fast path for un-sharded tenants or broadcast keys
+    if count < ShardCount(2) || key_is_broadcast(key) {
+        return ShardNumber(0);
+    }
+
+    // spcNode
+    let mut hash = murmurhash32(key.field2);
+    // dbNode
+    hash = hash_combine(hash, murmurhash32(key.field3));
+    // relNode
+    hash = hash_combine(hash, murmurhash32(key.field4));
+    // blockNum/stripe size
+    hash = hash_combine(hash, murmurhash32(key.field6 / stripe_size.0));
+
+    ShardNumber((hash % count.0 as u32) as u8)
 }
 
 #[cfg(test)]
@@ -317,5 +459,30 @@ mod tests {
         assert_eq!(example, decoded);
 
         Ok(())
+    }
+
+    // These are only smoke tests to spot check that our implementation doesn't
+    // deviate from a few examples values: not aiming to validate the overall
+    // hashing algorithm.
+    #[test]
+    fn murmur_hash() {
+        assert_eq!(murmurhash32(0), 0);
+
+        assert_eq!(hash_combine(0xb1ff3b40, 0), 0xfb7923c9);
+    }
+
+    #[test]
+    fn shard_mapping() {
+        let key = Key {
+            field1: 0x00,
+            field2: 0x67f,
+            field3: 0x5,
+            field4: 0x400c,
+            field5: 0x00,
+            field6: 0x7d06,
+        };
+
+        let shard = key_to_shard_number(ShardCount(10), DEFAULT_STRIPE_SIZE, &key);
+        assert_eq!(shard, ShardNumber(3));
     }
 }
