@@ -334,6 +334,11 @@ pub struct TenantConf {
     #[serde(with = "humantime_serde")]
     pub evictions_low_residence_duration_metric_threshold: Duration,
     pub gc_feedback: bool,
+
+    /// Whether to upload a heatmap to remote storage, for use by secondary mode.
+    /// This may be left disabled if a Tenant will only every be attached to
+    /// one node.
+    pub enable_heatmap: bool,
 }
 
 /// Same as TenantConf, but this struct preserves the information about
@@ -414,6 +419,10 @@ pub struct TenantConfOpt {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub gc_feedback: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub enable_heatmap: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +491,7 @@ impl TenantConfOpt {
                 .evictions_low_residence_duration_metric_threshold
                 .unwrap_or(global_conf.evictions_low_residence_duration_metric_threshold),
             gc_feedback: self.gc_feedback.unwrap_or(global_conf.gc_feedback),
+            enable_heatmap: self.enable_heatmap.unwrap_or(global_conf.enable_heatmap),
         }
     }
 }
@@ -519,6 +529,7 @@ impl Default for TenantConf {
             )
             .expect("cannot parse default evictions_low_residence_duration_metric_threshold"),
             gc_feedback: false,
+            enable_heatmap: false,
         }
     }
 }
@@ -535,6 +546,8 @@ impl TryFrom<&'_ models::TenantConfig> for TenantConfOpt {
 
         // Use serde_path_to_error to deserialize the JSON Value into TenantConfOpt
         let tenant_conf: TenantConfOpt = serde_path_to_error::deserialize(deserializer)?;
+
+        tenant_conf.enable_heatmap = request_data.enable_heatmap;
 
         Ok(tenant_conf)
     }
