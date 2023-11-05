@@ -1339,9 +1339,11 @@ impl<'a> DatadirModification<'a> {
         self.pending_nblocks = 0;
 
         for (key, value) in self.pending_updates.drain() {
+            tracing::debug!("commit: put {} @ {}", key, lsn);
             writer.put(key, lsn, &value, ctx).await?;
         }
         for key_range in self.pending_deletions.drain(..) {
+            tracing::debug!("commit: delete {:?} @ {}", key_range, lsn);
             writer.delete(key_range, lsn).await?;
         }
 
@@ -1352,6 +1354,10 @@ impl<'a> DatadirModification<'a> {
         }
 
         Ok(())
+    }
+
+    pub fn is_no_op(&self) -> bool {
+        self.pending_updates.is_empty() && self.pending_deletions.is_empty()
     }
 
     // Internal helper functions to batch the modifications
