@@ -1316,7 +1316,7 @@ impl Timeline {
 
     pub(crate) fn get_shard(&self) -> ShardIdentity {
         let tenant_conf = &self.tenant_conf.read().unwrap();
-        tenant_conf.shard.clone()
+        tenant_conf.shard
     }
 
     pub(super) fn tenant_conf_updated(&self) {
