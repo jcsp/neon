@@ -845,7 +845,10 @@ impl TenantManager {
         ctx: &RequestContext,
     ) -> Result<(), anyhow::Error> {
         debug_assert_current_span_has_tenant_id();
-        info!("configuring tenant location to state {new_location_config:?}");
+        info!(
+            "configuring tenant location {tenant_shard_id} {} to state {new_location_config:?}",
+            new_location_config.shard.slug()
+        );
 
         // Special case fast-path for updates to Tenant: if our upsert is only updating configuration,
         // then we do not need to set the slot to InProgress, we can just call into the
