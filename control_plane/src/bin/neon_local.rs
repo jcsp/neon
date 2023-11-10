@@ -26,6 +26,7 @@ use safekeeper_api::{
     DEFAULT_PG_LISTEN_PORT as DEFAULT_SAFEKEEPER_PG_PORT,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
@@ -96,6 +97,22 @@ struct TimelineTreeEl {
     pub name: Option<String>,
     /// Holds all direct children of this timeline referenced using `timeline_id`.
     pub children: BTreeSet<TimelineId>,
+}
+
+/// Helper for CLI args that contain a comma-separate list of NodeId
+fn parse_ids_arg(
+    matches: &ArgMatches,
+    arg: &str,
+) -> Result<Option<Vec<NodeId>>, std::num::ParseIntError> {
+    if let Some(id_str) = matches.get_one::<String>(arg) {
+        let r: Result<Vec<_>, ParseIntError> = id_str
+            .split(',')
+            .map(|ps_id| u64::from_str(str::trim(ps_id)).map(NodeId))
+            .collect();
+        r.map(Some)
+    } else {
+        Ok(Some(vec![DEFAULT_PAGESERVER_ID]))
+    }
 }
 
 // Main entry point for the 'neon_local' CLI utility
@@ -432,7 +449,7 @@ fn handle_tenant(tenant_match: &ArgMatches, env: &mut local_env::LocalEnv) -> an
                 let location_conf = LocationConfig {
                     shard_count,
                     shard_number,
-                    shard_stripe_size: 32000,
+                    shard_stripe_size: 32768,
                     mode: LocationConfigMode::AttachedSingle,
                     generation: generation.map(Generation::new),
                     secondary_conf: None,
@@ -583,7 +600,7 @@ fn handle_timeline(timeline_match: &ArgMatches, env: &mut local_env::LocalEnv) -
                 None,
                 pg_version,
                 ComputeMode::Primary,
-                DEFAULT_PAGESERVER_ID,
+                vec![DEFAULT_PAGESERVER_ID],
             )?;
             println!("Done");
         }
@@ -733,13 +750,8 @@ fn handle_endpoint(ep_match: &ArgMatches, env: &local_env::LocalEnv) -> Result<(
                 .copied()
                 .unwrap_or(false);
 
-            let pageserver_id =
-                if let Some(id_str) = sub_args.get_one::<String>("endpoint-pageserver-id") {
-                    NodeId(id_str.parse().context("while parsing pageserver id")?)
-                } else {
-                    DEFAULT_PAGESERVER_ID
-                };
-
+            let pageserver_ids = parse_ids_arg(sub_args, "endpoint-pageserver-id")?
+                .unwrap_or(vec![DEFAULT_PAGESERVER_ID]);
             let mode = match (lsn, hot_standby) {
                 (Some(lsn), false) => ComputeMode::Static(lsn),
                 (None, true) => ComputeMode::Replica,
@@ -755,7 +767,7 @@ fn handle_endpoint(ep_match: &ArgMatches, env: &local_env::LocalEnv) -> Result<(
                 http_port,
                 pg_version,
                 mode,
-                pageserver_id,
+                pageserver_ids,
             )?;
         }
         "start" => {
@@ -765,33 +777,19 @@ fn handle_endpoint(ep_match: &ArgMatches, env: &local_env::LocalEnv) -> Result<(
                 .get_one::<String>("endpoint_id")
                 .ok_or_else(|| anyhow!("No endpoint ID was provided to start"))?;
 
-            let pageserver_id =
-                if let Some(id_str) = sub_args.get_one::<String>("endpoint-pageserver-id") {
-                    NodeId(id_str.parse().context("while parsing pageserver id")?)
-                } else {
-                    DEFAULT_PAGESERVER_ID
-                };
+            let pageservers = parse_ids_arg(sub_args, "endpoint-pageserver-id")?
+                .unwrap_or(vec![DEFAULT_PAGESERVER_ID]);
 
             let remote_ext_config = sub_args.get_one::<String>("remote-ext-config");
 
             // If --safekeepers argument is given, use only the listed safekeeper nodes.
-            let safekeepers =
-                if let Some(safekeepers_str) = sub_args.get_one::<String>("safekeepers") {
-                    let mut safekeepers: Vec<NodeId> = Vec::new();
-                    for sk_id in safekeepers_str.split(',').map(str::trim) {
-                        let sk_id = NodeId(u64::from_str(sk_id).map_err(|_| {
-                            anyhow!("invalid node ID \"{sk_id}\" in --safekeepers list")
-                        })?);
-                        safekeepers.push(sk_id);
-                    }
-                    safekeepers
-                } else {
-                    env.safekeepers.iter().map(|sk| sk.id).collect()
-                };
+            let safekeepers = parse_ids_arg(sub_args, "safekeepers")?
+                .unwrap_or_else(|| env.safekeepers.iter().map(|sk| sk.id).collect());
 
             let endpoint = cplane.endpoints.get(endpoint_id.as_str());
 
-            let ps_conf = env.get_pageserver_conf(pageserver_id)?;
+            // We assume that all pageservers have the same auth conf
+            let ps_conf = env.get_pageserver_conf(pageservers[0])?;
             let auth_token = if matches!(ps_conf.pg_auth_type, AuthType::NeonJWT) {
                 let claims = Claims::new(Some(tenant_id), Scope::Tenant);
 
@@ -859,7 +857,7 @@ fn handle_endpoint(ep_match: &ArgMatches, env: &local_env::LocalEnv) -> Result<(
                     http_port,
                     pg_version,
                     mode,
-                    pageserver_id,
+                    pageservers,
                 )?;
                 ep.start(&auth_token, safekeepers, remote_ext_config)?;
             }
@@ -872,15 +870,21 @@ fn handle_endpoint(ep_match: &ArgMatches, env: &local_env::LocalEnv) -> Result<(
                 .endpoints
                 .get(endpoint_id.as_str())
                 .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
-            let pageserver_id =
-                if let Some(id_str) = sub_args.get_one::<String>("endpoint-pageserver-id") {
-                    Some(NodeId(
-                        id_str.parse().context("while parsing pageserver id")?,
-                    ))
-                } else {
-                    None
-                };
-            endpoint.reconfigure(pageserver_id)?;
+            let pageserver_ids: Option<Result<Vec<NodeId>, _>> = sub_args
+                .get_many::<String>("endpoint-pageserver-id")
+                .map(|ids| {
+                    ids.map(|id_str| id_str.parse().context("while parsing pageserver id"))
+                        .map(|r| r.map(NodeId))
+                        .collect()
+                });
+
+            let pageserver_ids = match pageserver_ids {
+                Some(Ok(v)) => Ok(Some(v)),
+                Some(Err(e)) => Err(e),
+                None => Ok(None),
+            }?;
+
+            endpoint.reconfigure(pageserver_ids)?;
         }
         "stop" => {
             let endpoint_id = sub_args

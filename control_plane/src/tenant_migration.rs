@@ -157,7 +157,7 @@ pub fn migrate_tenant(
                 "🔁 Reconfiguring endpoint {} to use pageserver {}",
                 endpoint_name, dest_ps.conf.id
             );
-            endpoint.reconfigure(Some(dest_ps.conf.id))?;
+            endpoint.reconfigure(Some(vec![dest_ps.conf.id]))?;
         }
     }
 
