@@ -181,6 +181,25 @@ impl Timeline {
         }
 
         let key = rel_block_to_key(tag, blknum);
+
+        // This check is needed because get page requests can race with sharding configuration
+        // changes: we should drop the connection, and let postgres connect to the correct
+        // pageserver once it has been advised of the latest configuration by the control plane.
+        //
+        // It is important for correctness that we refuse to service the request, rather than serving a
+        // zero page: to do so would likely cause corruption in postgres.
+        //
+        // TODO: similar checks for other page_service request types
+        if !self.get_shard().is_key_local(&key) {
+            tracing::info!(%key, "Tried to fetch key that does not belong on this shard");
+            // TODO: this error is good enough for testing, but before implementing shard splitting,
+            // we should amend it to express an error type that causes the connection handler to drop
+            // the connection and/or emit an error code that postgres will understand to mean "wrong node"
+            return Err(PageReconstructError::Other(anyhow::anyhow!(
+                "Request routed to wrong shard"
+            )));
+        }
+
         self.get(key, lsn, ctx).await
     }
 
