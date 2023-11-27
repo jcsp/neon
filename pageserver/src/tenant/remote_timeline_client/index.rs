@@ -12,6 +12,7 @@ use crate::tenant::metadata::TimelineMetadata;
 use crate::tenant::storage_layer::LayerFileName;
 use crate::tenant::upload_queue::UploadQueueInitialized;
 use crate::tenant::Generation;
+use pageserver_api::shard::ShardIndex;
 
 use utils::lsn::Lsn;
 
@@ -25,6 +26,8 @@ pub struct LayerFileMetadata {
     file_size: u64,
 
     pub(crate) generation: Generation,
+
+    pub(crate) shard: ShardIndex,
 }
 
 impl From<&'_ IndexLayerMetadata> for LayerFileMetadata {
@@ -32,15 +35,17 @@ impl From<&'_ IndexLayerMetadata> for LayerFileMetadata {
         LayerFileMetadata {
             file_size: other.file_size,
             generation: other.generation,
+            shard: other.shard,
         }
     }
 }
 
 impl LayerFileMetadata {
-    pub fn new(file_size: u64, generation: Generation) -> Self {
+    pub fn new(file_size: u64, generation: Generation, shard: ShardIndex) -> Self {
         LayerFileMetadata {
             file_size,
             generation,
+            shard,
         }
     }
 
@@ -153,6 +158,10 @@ pub struct IndexLayerMetadata {
     #[serde(default = "Generation::none")]
     #[serde(skip_serializing_if = "Generation::is_none")]
     pub generation: Generation,
+
+    #[serde(default = "ShardIndex::unsharded")]
+    #[serde(skip_serializing_if = "ShardIndex::is_unsharded")]
+    pub shard: ShardIndex,
 }
 
 impl From<LayerFileMetadata> for IndexLayerMetadata {
@@ -160,6 +169,7 @@ impl From<LayerFileMetadata> for IndexLayerMetadata {
         IndexLayerMetadata {
             file_size: other.file_size,
             generation: other.generation,
+            shard: other.shard,
         }
     }
 }
@@ -187,13 +197,15 @@ mod tests {
             layer_metadata: HashMap::from([
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696070-00000000016960E9".parse().unwrap(), IndexLayerMetadata {
                     file_size: 25600000,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 }),
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap(), IndexLayerMetadata {
                     // serde_json should always parse this but this might be a double with jq for
                     // example.
                     file_size: 9007199254741001,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 })
             ]),
             disk_consistent_lsn: "0/16960E8".parse::<Lsn>().unwrap(),
@@ -225,13 +237,15 @@ mod tests {
             layer_metadata: HashMap::from([
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696070-00000000016960E9".parse().unwrap(), IndexLayerMetadata {
                     file_size: 25600000,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 }),
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap(), IndexLayerMetadata {
                     // serde_json should always parse this but this might be a double with jq for
                     // example.
                     file_size: 9007199254741001,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 })
             ]),
             disk_consistent_lsn: "0/16960E8".parse::<Lsn>().unwrap(),
@@ -264,13 +278,15 @@ mod tests {
             layer_metadata: HashMap::from([
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696070-00000000016960E9".parse().unwrap(), IndexLayerMetadata {
                     file_size: 25600000,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 }),
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap(), IndexLayerMetadata {
                     // serde_json should always parse this but this might be a double with jq for
                     // example.
                     file_size: 9007199254741001,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 })
             ]),
             disk_consistent_lsn: "0/16960E8".parse::<Lsn>().unwrap(),
@@ -346,19 +362,21 @@ mod tests {
             layer_metadata: HashMap::from([
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696070-00000000016960E9".parse().unwrap(), IndexLayerMetadata {
                     file_size: 25600000,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 }),
                 ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap(), IndexLayerMetadata {
                     // serde_json should always parse this but this might be a double with jq for
                     // example.
                     file_size: 9007199254741001,
-                    generation: Generation::none()
+                    generation: Generation::none(),
+                    shard: ShardIndex::unsharded()
                 })
             ]),
             disk_consistent_lsn: "0/16960E8".parse::<Lsn>().unwrap(),
             metadata: TimelineMetadata::from_bytes(&[113,11,159,210,0,54,0,4,0,0,0,0,1,105,96,232,1,0,0,0,0,1,105,96,112,0,0,0,0,0,0,0,0,0,0,0,0,0,1,105,96,112,0,0,0,0,1,105,96,112,0,0,0,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]).unwrap(),
             deleted_at: Some(chrono::NaiveDateTime::parse_from_str(
-                "2023-07-31T09:00:00.123000000", "%Y-%m-%dT%H:%M:%S.%f").unwrap())
+                "2023-07-31T09:00:00.123000000", "%Y-%m-%dT%H:%M:%S.%f").unwrap()),
         };
 
         let part = serde_json::from_str::<IndexPart>(example).unwrap();

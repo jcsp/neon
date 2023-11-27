@@ -55,6 +55,10 @@ impl TenantShardId {
         }
     }
 
+    pub fn is_unshared(&self) -> bool {
+        self.shard_number == ShardNumber(0) && self.shard_count == ShardCount(0)
+    }
+
     /// The range of all TenantShardId that belong to a particular TenantId.  This is useful when
     /// you have a BTreeMap of TenantShardId, and are querying by TenantId.
     pub fn tenant_range(tenant_id: TenantId) -> RangeInclusive<Self> {
@@ -136,6 +140,61 @@ impl From<[u8; 18]> for TenantShardId {
             tenant_id: TenantId::from(tenant_id_bytes),
             shard_number: ShardNumber(b[16]),
             shard_count: ShardCount(b[17]),
+        }
+    }
+}
+
+/// For use within the context of a particular tenant, when we need to know which
+/// shard we're dealing with, but do not need to know the full ShardIdentity (because
+/// we won't be doing any page->shard mapping), and do not need to know the fully qualified
+/// TenantShardId.
+#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy)]
+pub struct ShardIndex {
+    pub shard_number: ShardNumber,
+    pub shard_count: ShardCount,
+}
+
+impl ShardIndex {
+    pub fn unsharded() -> Self {
+        Self {
+            shard_number: ShardNumber(0),
+            shard_count: ShardCount(0),
+        }
+    }
+
+    pub fn is_unsharded(&self) -> bool {
+        self.shard_number == ShardNumber(0) && self.shard_count == ShardCount(0)
+    }
+}
+
+impl std::fmt::Display for ShardIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02x}{:02x}", self.shard_number.0, self.shard_count.0)
+    }
+}
+
+impl std::fmt::Debug for ShardIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug is the same as Display: the compact hex representation
+        write!(f, "{}", self)
+    }
+}
+
+impl std::str::FromStr for ShardIndex {
+    type Err = hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Expect format: 1 byte shard number, 1 byte shard count
+        if s.len() == 4 {
+            let bytes = s.as_bytes();
+            let mut shard_parts: [u8; 2] = [0u8; 2];
+            hex::decode_to_slice(&bytes, &mut shard_parts)?;
+            Ok(Self {
+                shard_number: ShardNumber(shard_parts[0]),
+                shard_count: ShardCount(shard_parts[1]),
+            })
+        } else {
+            Err(hex::FromHexError::InvalidStringLength)
         }
     }
 }
