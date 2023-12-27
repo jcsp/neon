@@ -22,7 +22,9 @@ set -e
 
 cargo build $ARGS --features=testing
 
-cargo neon $ARGS init --num-pageservers=$PAGESERVERS && RUST_LOG=$RUST_LOG cargo neon $ARGS start && cargo neon $ARGS tenant create --shard-count=$INITIAL_SHARDS --shard-stripe-size=$STRIPE_SIZE  --tenant-id=$TENANT_ID --timeline-id=3d34095be52fec4c44a92e774c573b57 --set-default
+cargo neon $ARGS init --num-pageservers=$PAGESERVERS
+RUST_LOG=$RUST_LOG cargo neon $ARGS start
+cargo neon $ARGS tenant create --shard-count=$INITIAL_SHARDS --shard-stripe-size=$STRIPE_SIZE  --tenant-id=$TENANT_ID --timeline-id=3d34095be52fec4c44a92e774c573b57 --set-default
 
 cargo neon $ARGS endpoint create && cargo neon $ARGS endpoint start ep-main
 
@@ -43,19 +45,19 @@ cargo neon $ARGS tenant status
 #INITIAL_SHARDS=1 bash demo_sharding.sh
 #neon tenant status
 
-#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -T 30 -P 1 -c 64
-#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -T 30 -P 1 -c 64 -S
+#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -t 4096 -P 1 -c 64
+#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -t 4096 -P 1 -c 64 -S
 
 # Pt2: four shards
 
 #INITIAL_SHARDS=4 bash demo_sharding.sh
 #neon tenant status
 
-#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -T 30 -P 1 -c 64
-#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -T 30 -P 1 -c 64 -S
+#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -t 4096 -P 1 -c 64
+#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -t 4096 -P 1 -c 64 -S
 
 # Pt3: 8 shards
 
 #bash demo_split_8.sh
-#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -T 30 -P 1 -c 64 -S
+#taskset -c 12-15 pgbench postgres -h 127.0.0.1 -p 55432 -U cloud_admin -t 4096 -P 1 -c 64 -S
 
