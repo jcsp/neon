@@ -3066,7 +3066,9 @@ impl Timeline {
                                 }
                             }
                         };
-                        image_layer_writer.put_image(key, &img).await?;
+                        if self.shard_identity.is_key_local(&key) {
+                            image_layer_writer.put_image(key, &img).await?;
+                        }
                         key = key.next();
                     }
                 }
@@ -3636,7 +3638,9 @@ impl Timeline {
                 )))
             });
 
-            writer.as_mut().unwrap().put_value(key, lsn, value).await?;
+            if self.shard_identity.is_key_local(&key) {
+                writer.as_mut().unwrap().put_value(key, lsn, value).await?;
+            }
 
             if !new_layers.is_empty() {
                 fail_point!("after-timeline-compacted-first-L1");
