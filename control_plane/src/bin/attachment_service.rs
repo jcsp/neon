@@ -9,9 +9,9 @@ use clap::Parser;
 use hyper::{Body, Request, Response};
 use hyper::{Method, StatusCode};
 use pageserver_api::models::{
-    LocationConfig, LocationConfigMode, ShardParameters, TenantConfig, TenantCreateRequest,
-    TenantLocationConfigRequest, TenantShardSplitRequest, TenantShardSplitResponse,
-    TimelineCreateRequest, TimelineInfo,
+    LocationConfig, LocationConfigMode, LocationConfigSecondary, ShardParameters, TenantConfig,
+    TenantCreateRequest, TenantLocationConfigRequest, TenantShardSplitRequest,
+    TenantShardSplitResponse, TimelineCreateRequest, TimelineInfo,
 };
 use pageserver_api::shard::{ShardCount, ShardIdentity, ShardNumber, TenantShardId};
 use reqwest::Client;
@@ -19,10 +19,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use utils::generation::Generation;
 use utils::http::endpoint::request_span;
 use utils::http::request::parse_request_param;
 use utils::id::TenantId;
 use utils::logging::{self, LogFormat};
+use utils::seqwait::{MonotonicCounter, SeqWait, SeqWaitError};
 use utils::signals::{ShutdownSignals, Signal};
 
 use utils::{
@@ -69,7 +74,7 @@ struct Cli {
 ///       what it is (e.g. we failed partway through configuring it)
 ///     * Instance exists with conf==Some: this tells us what we last successfully configured on this node,
 ///       and that configuration will still be present unless something external interfered.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ObservedStateLocation {
     /// If None, it means we do not know the status of this shard's location on this node, but
     /// we know that we might have some state on this node.
@@ -91,12 +96,12 @@ impl Default for PlacementPolicy {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct ObservedState {
     locations: HashMap<NodeId, ObservedStateLocation>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct IntentState {
     attached: Option<NodeId>,
     secondary: Vec<NodeId>,
@@ -123,15 +128,72 @@ impl IntentState {
     }
 }
 
+/// When a reconcile task completes, it sends this result object
+/// to be applied to the primary TenantState.
+struct ReconcileResult {
+    sequence: Sequence,
+    /// On errors, `observed` should be treated as an incompleted description
+    /// of state (i.e. any nodes present in the result should override nodes
+    /// present in the parent tenant state, but any unmentioned nodes should
+    /// not be removed from parent tenant state)
+    result: Result<(), ReconcileError>,
+
+    tenant_shard_id: TenantShardId,
+    generation: Generation,
+    observed: ObservedState,
+}
+
+#[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Copy, Clone)]
+struct Sequence(u64);
+
+impl MonotonicCounter<Sequence> for Sequence {
+    fn cnt_advance(&mut self, v: Sequence) {
+        assert!(*self <= v);
+        *self = v;
+    }
+    fn cnt_value(&self) -> Sequence {
+        *self
+    }
+}
+
+/// Having spawned a reconciler task, the tenant shard's state will carry enough
+/// information to optionally cancel & await it later.
+struct ReconcilerHandle {
+    sequence: Sequence,
+    handle: JoinHandle<()>,
+    cancel: CancellationToken,
+}
+
+struct ReconcilerWaiter {
+    // For observability purposes, remember the ID of the shard we're
+    // waiting for.
+    tenant_shard_id: TenantShardId,
+
+    seq_wait: std::sync::Arc<SeqWait<Sequence, Sequence>>,
+    seq: Sequence,
+}
+
+impl ReconcilerWaiter {
+    async fn wait_timeout(&self, timeout: Duration) -> Result<(), SeqWaitError> {
+        self.seq_wait.wait_for_timeout(self.seq, timeout).await
+    }
+}
+
+fn default_waiter() -> std::sync::Arc<SeqWait<Sequence, Sequence>> {
+    std::sync::Arc::new(SeqWait::new(Sequence(1)))
+}
+
 #[derive(Serialize, Deserialize)]
 struct TenantState {
     tenant_shard_id: TenantShardId,
 
     shard: ShardIdentity,
 
+    sequence: Sequence,
+
     // Latest generation number: next time we attach, increment this
     // and use the incremented number when attaching
-    generation: u32,
+    generation: Generation,
 
     // High level description of how the tenant should be set up.  Provided
     // externally.
@@ -147,6 +209,17 @@ struct TenantState {
     observed: ObservedState,
 
     config: TenantConfig,
+
+    /// If a reconcile task is currently in flight, it may be joined here (it is
+    /// only safe to join if either the result has been received or the reconciler's
+    /// cancellation token has been fired)
+    #[serde(skip)]
+    reconciler: Option<ReconcilerHandle>,
+
+    /// Optionally wait for reconciliation to complete up to a particular
+    /// sequence number.
+    #[serde(skip, default = "default_waiter")]
+    waiter: std::sync::Arc<SeqWait<Sequence, Sequence>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -170,33 +243,44 @@ impl NodeState {
 }
 
 // Top level state available to all HTTP handlers
-#[derive(Serialize, Deserialize)]
 struct PersistentState {
     tenants: BTreeMap<TenantShardId, TenantState>,
 
-    pageservers: HashMap<NodeId, NodeState>,
+    pageservers: Arc<HashMap<NodeId, NodeState>>,
 
-    #[serde(skip)]
+    result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
+
     path: PathBuf,
 }
 
 impl PersistentState {
     async fn save(&self) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(self)?;
+        let bytes = serde_json::to_vec(&self.tenants)?;
         tokio::fs::write(&self.path, &bytes).await?;
 
         Ok(())
     }
 
-    async fn load(path: &Path) -> anyhow::Result<Self> {
+    async fn load(
+        path: &Path,
+        result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
+    ) -> anyhow::Result<Self> {
         let bytes = tokio::fs::read(path).await?;
-        let mut decoded = serde_json::from_slice::<Self>(&bytes)?;
-        decoded.path = path.to_owned();
-        Ok(decoded)
+        let tenants = serde_json::from_slice::<BTreeMap<TenantShardId, TenantState>>(&bytes)?;
+        Ok(Self {
+            tenants,
+            pageservers: Arc::default(),
+            result_tx,
+
+            path: path.to_owned(),
+        })
     }
 
-    async fn load_or_new(path: &Path) -> Self {
-        match Self::load(path).await {
+    async fn load_or_new(
+        path: &Path,
+        result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
+    ) -> Self {
+        match Self::load(path, result_tx.clone()).await {
             Ok(s) => {
                 tracing::info!("Loaded state file at {}", path.display());
                 s
@@ -209,8 +293,9 @@ impl PersistentState {
                 tracing::info!("Will create state file at {}", path.display());
                 Self {
                     tenants: BTreeMap::new(),
-                    pageservers: HashMap::new(),
+                    pageservers: Arc::new(HashMap::new()),
                     path: path.to_owned(),
+                    result_tx,
                 }
             }
             Err(e) => {
@@ -227,9 +312,9 @@ struct State {
 }
 
 impl State {
-    fn new(persistent_state: PersistentState) -> State {
+    fn new(persistent_state: Arc<tokio::sync::RwLock<PersistentState>>) -> State {
         Self {
-            inner: Arc::new(tokio::sync::RwLock::new(persistent_state)),
+            inner: persistent_state,
         }
     }
 }
@@ -243,6 +328,221 @@ fn get_state(request: &Request<Body>) -> &State {
 }
 
 impl TenantState {
+    fn new(tenant_shard_id: TenantShardId, shard: ShardIdentity, policy: PlacementPolicy) -> Self {
+        Self {
+            tenant_shard_id,
+            policy,
+            intent: IntentState::default(),
+            generation: Generation::new(0),
+            shard,
+            observed: ObservedState::default(),
+            config: TenantConfig::default(),
+            reconciler: None,
+            sequence: Sequence(1),
+            waiter: Arc::new(SeqWait::new(Sequence(0))),
+        }
+    }
+
+    fn schedule(&mut self, scheduler: &mut Scheduler) -> Result<(), ScheduleError> {
+        // TODO: before scheduling new nodes, check if any existing content in
+        // self.intent refers to pageservers that are offline, and pick other
+        // pageservers if so.
+
+        // Build the set of pageservers already in use by this tenant, to avoid scheduling
+        // more work on the same pageservers we're already using.
+        let mut used_pageservers = self.intent.all_pageservers();
+        let mut modified = false;
+
+        use PlacementPolicy::*;
+        match self.policy {
+            Single => {
+                todo!()
+            }
+            Double(secondary_count) => {
+                // Should have exactly one attached
+                if self.intent.attached.is_none() {
+                    let node_id = scheduler.schedule_shard(&used_pageservers)?;
+                    self.intent.attached = Some(node_id);
+                    used_pageservers.push(node_id);
+                    modified = true;
+                }
+
+                while self.intent.secondary.len() < secondary_count {
+                    let node_id = scheduler.schedule_shard(&used_pageservers)?;
+                    self.intent.secondary.push(node_id);
+                    used_pageservers.push(node_id);
+                    modified = true;
+                }
+            }
+        }
+
+        if modified {
+            self.sequence.0 += 1;
+        }
+
+        Ok(())
+    }
+
+    fn dirty(&self) -> bool {
+        if let Some(node_id) = self.intent.attached {
+            let wanted_conf = attached_location_conf(self.generation, &self.shard, &self.config);
+            match self.observed.locations.get(&node_id) {
+                Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {}
+                Some(_) | None => {
+                    return true;
+                }
+            }
+        }
+
+        for node_id in &self.intent.secondary {
+            let wanted_conf = secondary_location_conf(&self.shard, &self.config);
+            match self.observed.locations.get(&node_id) {
+                Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {}
+                Some(_) | None => {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn maybe_reconcile(
+        &mut self,
+        result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
+        pageservers: &Arc<HashMap<NodeId, NodeState>>,
+    ) -> Option<ReconcilerWaiter> {
+        if !self.dirty() {
+            return None;
+        }
+
+        // Reconcile already in flight for the current sequence?
+        if let Some(handle) = &self.reconciler {
+            if handle.sequence == self.sequence {
+                return Some(ReconcilerWaiter {
+                    tenant_shard_id: self.tenant_shard_id,
+                    seq_wait: self.waiter.clone(),
+                    seq: self.sequence,
+                });
+            }
+        }
+
+        // Reconcile in flight for a stale sequence?  Our sequence's task will wait for it before
+        // doing our sequence's work.
+        let old_handle = self.reconciler.take();
+
+        let cancel = CancellationToken::new();
+        let mut reconciler = Reconciler {
+            tenant_shard_id: self.tenant_shard_id,
+            shard: self.shard,
+            generation: self.generation,
+            intent: self.intent.clone(),
+            config: self.config.clone(),
+            observed: self.observed.clone(),
+            pageservers: pageservers.clone(),
+            cancel: cancel.clone(),
+        };
+
+        let reconcile_seq = self.sequence;
+
+        let join_handle = tokio::task::spawn(async move {
+            // Wait for any previous reconcile task to complete before we start
+            if let Some(old_handle) = old_handle {
+                old_handle.cancel.cancel();
+                if let Err(e) = old_handle.handle.await {
+                    // We can't do much with this other than log it: the task is done, so
+                    // we may proceed with our work.
+                    tracing::error!("Unexpected join error waiting for reconcile task: {e}");
+                }
+            }
+
+            // Early check for cancellation before doing any work
+            // TODO: wrap all remote API operations in cancellation check
+            // as well.
+            if reconciler.cancel.is_cancelled() {
+                return ();
+            }
+
+            let result = reconciler.reconcile().await;
+            result_tx
+                .send(ReconcileResult {
+                    sequence: reconcile_seq,
+                    result,
+                    tenant_shard_id: reconciler.tenant_shard_id,
+                    generation: reconciler.generation,
+                    observed: reconciler.observed,
+                })
+                .ok();
+            ()
+        });
+
+        self.reconciler = Some(ReconcilerHandle {
+            sequence: self.sequence,
+            handle: join_handle,
+            cancel,
+        });
+
+        Some(ReconcilerWaiter {
+            tenant_shard_id: self.tenant_shard_id,
+            seq_wait: self.waiter.clone(),
+            seq: self.sequence,
+        })
+    }
+}
+
+/// Object with the lifetime of the background reconcile task that is created
+/// for tenants which have a difference between their intent and observed states.
+struct Reconciler {
+    /// See [`TenantState`] for the meanings of these fields: they are a snapshot
+    /// of a tenant's state from when we spawned a reconcile task.
+    tenant_shard_id: TenantShardId,
+    shard: ShardIdentity,
+    generation: Generation,
+    intent: IntentState,
+    config: TenantConfig,
+    observed: ObservedState,
+
+    /// A snapshot of the pageservers as they were when we were asked
+    /// to reconcile.
+    pageservers: Arc<HashMap<NodeId, NodeState>>,
+
+    /// A means to abort background reconciliation: it is essential to
+    /// call this when something changes in the original TenantState that
+    /// will make this reconciliation impossible or unnecessary, for
+    /// example when a pageserver node goes offline, or the PlacementPolicy for
+    /// the tenant is changed.
+    cancel: CancellationToken,
+}
+
+fn attached_location_conf(
+    generation: Generation,
+    shard: &ShardIdentity,
+    config: &TenantConfig,
+) -> LocationConfig {
+    LocationConfig {
+        mode: LocationConfigMode::AttachedSingle,
+        generation: generation.into(),
+        secondary_conf: None,
+        shard_number: shard.number.0,
+        shard_count: shard.count.0,
+        shard_stripe_size: shard.stripe_size.0,
+        tenant_conf: config.clone(),
+    }
+}
+
+fn secondary_location_conf(shard: &ShardIdentity, config: &TenantConfig) -> LocationConfig {
+    LocationConfig {
+        mode: LocationConfigMode::Secondary,
+        generation: None,
+        secondary_conf: Some(LocationConfigSecondary { warm: true }),
+        shard_number: shard.number.0,
+        shard_count: shard.count.0,
+        shard_stripe_size: shard.stripe_size.0,
+        tenant_conf: config.clone(),
+    }
+}
+
+impl Reconciler {
     async fn location_config(
         &self,
         node: &NodeState,
@@ -271,77 +571,11 @@ impl TenantState {
         Ok(())
     }
 
-    async fn timeline_create(
-        &self,
-        node: &NodeState,
-        req: &TimelineCreateRequest,
-    ) -> anyhow::Result<TimelineInfo> {
-        let client = Client::new();
-        let response = client
-            .request(
-                Method::POST,
-                format!(
-                    "{}/tenant/{}/timeline",
-                    node.base_url(),
-                    self.tenant_shard_id
-                ),
-            )
-            .json(req)
-            .send()
-            .await?;
-        response.error_for_status_ref()?;
-
-        Ok(response.json().await?)
-    }
-
-    fn schedule(&mut self, scheduler: &mut Scheduler) -> Result<(), ScheduleError> {
-        // TODO: before scheduling new nodes, check if any existing content in
-        // self.intent refers to pageservers that are offline, and pick other
-        // pageservers if so.
-
-        // Build the set of pageservers already in use by this tenant, to avoid scheduling
-        // more work on the same pageservers we're already using.
-        let mut used_pageservers = self.intent.all_pageservers();
-
-        use PlacementPolicy::*;
-        match self.policy {
-            Single => {
-                todo!()
-            }
-            Double(secondary_count) => {
-                // Should have exactly one attached
-                if self.intent.attached.is_none() {
-                    let node_id = scheduler.schedule_shard(&used_pageservers)?;
-                    self.intent.attached = Some(node_id);
-                    used_pageservers.push(node_id);
-                }
-
-                while self.intent.secondary.len() < secondary_count {
-                    let node_id = scheduler.schedule_shard(&used_pageservers)?;
-                    self.intent.secondary.push(node_id);
-                    used_pageservers.push(node_id);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn reconcile(
-        &mut self,
-        pageservers: &HashMap<NodeId, NodeState>,
-    ) -> Result<(), ReconcileError> {
+    async fn reconcile(&mut self) -> Result<(), ReconcileError> {
         // If the attached pageserver is not attached, do so now.
         if let Some(node_id) = self.intent.attached {
-            let mut wanted_conf = LocationConfig {
-                mode: LocationConfigMode::AttachedSingle,
-                generation: Some(self.generation),
-                secondary_conf: None,
-                shard_number: self.shard.number.0,
-                shard_count: self.shard.count.0,
-                shard_stripe_size: self.shard.stripe_size.0,
-                tenant_conf: self.config.clone(),
-            };
+            let mut wanted_conf =
+                attached_location_conf(self.generation, &self.shard, &self.config);
             match self.observed.locations.get(&node_id) {
                 Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {
                     // Nothing to do
@@ -349,10 +583,11 @@ impl TenantState {
                 }
                 Some(_) | None => {
                     // If there is no observed configuration, or if its value does not equal our intent, then we must call out to the pageserver.
-                    self.generation += 1;
-                    wanted_conf.generation = Some(self.generation);
+                    self.generation = self.generation.next();
+                    wanted_conf.generation = self.generation.into();
                     tracing::info!("Observed configuration requires update.");
-                    let node = pageservers
+                    let node = self
+                        .pageservers
                         .get(&node_id)
                         .expect("Pageserver may not be removed while referenced");
                     self.location_config(node, wanted_conf).await?;
@@ -363,15 +598,7 @@ impl TenantState {
         // Configure secondary locations: if these were previously attached this
         // implicitly downgrades them from attached to secondary.
         for node_id in &self.intent.secondary {
-            let wanted_conf = LocationConfig {
-                mode: LocationConfigMode::Secondary,
-                generation: None,
-                secondary_conf: None,
-                shard_number: self.shard.number.0,
-                shard_count: self.shard.count.0,
-                shard_stripe_size: self.shard.stripe_size.0,
-                tenant_conf: self.config.clone(),
-            };
+            let wanted_conf = secondary_location_conf(&self.shard, &self.config);
             match self.observed.locations.get(&node_id) {
                 Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {
                     // Nothing to do
@@ -380,7 +607,8 @@ impl TenantState {
                 Some(_) | None => {
                     // If there is no observed configuration, or if its value does not equal our intent, then we must call out to the pageserver.
                     tracing::info!(%node_id, "Observed configuration requires update.");
-                    let node = pageservers
+                    let node = self
+                        .pageservers
                         .get(&node_id)
                         .expect("Pageserver may not be removed while referenced");
                     self.location_config(node, wanted_conf).await?;
@@ -397,7 +625,8 @@ impl TenantState {
                 continue;
             }
 
-            let node = pageservers
+            let node = self
+                .pageservers
                 .get(node_id)
                 .expect("Pageserver may not be removed while referenced");
             self.location_config(
@@ -431,10 +660,10 @@ async fn handle_re_attach(mut req: Request<Body>) -> Result<Response<Body>, ApiE
     };
     for (t, state) in &mut locked.tenants {
         if state.intent.attached == Some(reattach_req.node_id) {
-            state.generation += 1;
+            state.generation = state.generation.next();
             response.tenants.push(ReAttachResponseTenant {
                 id: *t,
-                gen: state.generation,
+                gen: state.generation.into().unwrap(),
             });
         }
     }
@@ -457,9 +686,9 @@ async fn handle_validate(mut req: Request<Body>) -> Result<Response<Body>, ApiEr
 
     for req_tenant in validate_req.tenants {
         if let Some(tenant_state) = locked.tenants.get(&req_tenant.id) {
-            let valid = tenant_state.generation == req_tenant.gen;
+            let valid = tenant_state.generation == Generation::new(req_tenant.gen);
             tracing::info!(
-                "handle_validate: {}(gen {}): valid={valid} (latest {})",
+                "handle_validate: {}(gen {}): valid={valid} (latest {:?})",
                 req_tenant.id,
                 req_tenant.gen,
                 tenant_state.generation
@@ -485,29 +714,27 @@ async fn handle_attach_hook(mut req: Request<Body>) -> Result<Response<Body>, Ap
     let tenant_state = locked
         .tenants
         .entry(attach_req.tenant_shard_id)
-        .or_insert_with(|| TenantState {
-            tenant_shard_id: attach_req.tenant_shard_id,
-            policy: PlacementPolicy::Single,
-            intent: IntentState::single(attach_req.node_id),
-            generation: 0,
-            shard: ShardIdentity::unsharded(),
-            observed: ObservedState::default(),
-            config: TenantConfig::default(),
+        .or_insert_with(|| {
+            TenantState::new(
+                attach_req.tenant_shard_id,
+                ShardIdentity::unsharded(),
+                PlacementPolicy::Single,
+            )
         });
 
     if let Some(attaching_pageserver) = attach_req.node_id.as_ref() {
-        tenant_state.generation += 1;
+        tenant_state.generation = tenant_state.generation.next();
         tracing::info!(
             tenant_id = %attach_req.tenant_shard_id,
             ps_id = %attaching_pageserver,
-            generation = %tenant_state.generation,
+            generation = ?tenant_state.generation,
             "issuing",
         );
     } else if let Some(ps_id) = tenant_state.intent.attached {
         tracing::info!(
             tenant_id = %attach_req.tenant_shard_id,
             %ps_id,
-            generation = %tenant_state.generation,
+            generation = ?tenant_state.generation,
             "dropping",
         );
     } else {
@@ -519,7 +746,7 @@ async fn handle_attach_hook(mut req: Request<Body>) -> Result<Response<Body>, Ap
     let generation = tenant_state.generation;
 
     tracing::info!(
-        "handle_attach_hook: tenant {} set generation {}, pageserver {}",
+        "handle_attach_hook: tenant {} set generation {:?}, pageserver {}",
         attach_req.tenant_shard_id,
         tenant_state.generation,
         attach_req.node_id.unwrap_or(utils::id::NodeId(0xfffffff))
@@ -530,7 +757,7 @@ async fn handle_attach_hook(mut req: Request<Body>) -> Result<Response<Body>, Ap
     json_response(
         StatusCode::OK,
         AttachHookResponse {
-            gen: attach_req.node_id.map(|_| generation),
+            gen: attach_req.node_id.map(|_| generation.into().unwrap()),
         },
     )
 }
@@ -545,7 +772,11 @@ async fn handle_inspect(mut req: Request<Body>) -> Result<Response<Body>, ApiErr
     json_response(
         StatusCode::OK,
         InspectResponse {
-            attachment: tenant_state.and_then(|s| s.intent.attached.map(|ps| (s.generation, ps))),
+            attachment: tenant_state.and_then(|s| {
+                s.intent
+                    .attached
+                    .map(|ps| (s.generation.into().unwrap(), ps))
+            }),
         },
     )
 }
@@ -694,21 +925,22 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
                         .intent
                         .attached
                         .expect("We just set pageserver if it was None"),
-                    generation: entry.get().generation,
+                    generation: entry.get().generation.into().unwrap(),
                 });
 
                 continue;
             }
             Entry::Vacant(entry) => {
-                let mut state = TenantState {
+                let mut state = TenantState::new(
                     tenant_shard_id,
-                    policy: PlacementPolicy::Double(1),
-                    intent: IntentState::default(),
-                    generation: create_req.generation.unwrap_or(1),
-                    shard: ShardIdentity::from_params(shard_number, &create_req.shard_parameters),
-                    observed: ObservedState::default(),
-                    config: create_req.config.clone(),
-                };
+                    ShardIdentity::from_params(shard_number, &create_req.shard_parameters),
+                    PlacementPolicy::Double(1),
+                );
+
+                if let Some(create_gen) = create_req.generation {
+                    state.generation = Generation::new(create_gen);
+                }
+                state.config = create_req.config.clone();
 
                 state.schedule(&mut scheduler).map_err(|e| {
                     ApiError::Conflict(format!("Failed to schedule shard {tenant_shard_id}: {e}"))
@@ -719,7 +951,7 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
                         .intent
                         .attached
                         .expect("We just set pageserver if it was None"),
-                    generation: state.generation,
+                    generation: state.generation.into().unwrap(),
                 });
                 entry.insert(state)
             }
@@ -729,19 +961,36 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
     // Take a snapshot of pageservers
     let pageservers = locked.pageservers.clone();
 
-    for (tenant_shard_id, shard) in locked
+    let mut waiters = Vec::new();
+    let result_tx = locked.result_tx.clone();
+
+    for (_tenant_shard_id, shard) in locked
         .tenants
         .range_mut(TenantShardId::tenant_range(tenant_id))
     {
-        shard.reconcile(&pageservers).await.map_err(|e| {
-            ApiError::Conflict(format!(
-                "Failed to reconcile tenant shard {}: {}",
-                tenant_shard_id, e
-            ))
-        })?;
+        if let Some(waiter) = shard.maybe_reconcile(result_tx.clone(), &pageservers) {
+            waiters.push(waiter);
+        }
     }
 
     locked.save().await.map_err(ApiError::InternalServerError)?;
+
+    // Drop the lock over state before waiting for reconciliation to happen.
+    drop(locked);
+
+    let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+    for waiter in waiters {
+        let timeout = deadline.duration_since(Instant::now());
+        waiter.wait_timeout(timeout).await.map_err(|_| {
+            ApiError::Timeout(
+                format!(
+                    "Timeout waiting for reconciliation of tenant shard {}",
+                    waiter.tenant_shard_id
+                )
+                .into(),
+            )
+        })?;
+    }
 
     json_response(
         StatusCode::OK,
@@ -751,12 +1000,72 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
     )
 }
 
+async fn ensure_attached<'a>(
+    mut locked: tokio::sync::RwLockWriteGuard<'a, PersistentState>,
+    tenant_id: TenantId,
+) -> Result<Option<tokio::sync::RwLockReadGuard<'a, PersistentState>>, anyhow::Error> {
+    let mut waiters = Vec::new();
+    let result_tx = locked.result_tx.clone();
+    let mut scheduler = Scheduler::new(&locked);
+    let pageservers = locked.pageservers.clone();
+    for (_tenant_shard_id, shard) in locked
+        .tenants
+        .range_mut(TenantShardId::tenant_range(tenant_id))
+    {
+        shard.schedule(&mut scheduler)?;
+
+        if let Some(waiter) = shard.maybe_reconcile(result_tx.clone(), &pageservers) {
+            waiters.push(waiter);
+        }
+    }
+
+    let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+    if waiters.is_empty() {
+        return Ok(Some(locked.downgrade()));
+    } else {
+        drop(locked);
+        for waiter in waiters {
+            let timeout = deadline.duration_since(Instant::now());
+            waiter.wait_timeout(timeout).await.map_err(|_| {
+                ApiError::Timeout(
+                    format!(
+                        "Timeout waiting for reconciliation of tenant shard {}",
+                        waiter.tenant_shard_id
+                    )
+                    .into(),
+                )
+            })?;
+        }
+
+        Ok(None)
+    }
+}
+
+async fn timeline_create(
+    tenant_shard_id: &TenantShardId,
+    node: &NodeState,
+    req: &TimelineCreateRequest,
+) -> anyhow::Result<TimelineInfo> {
+    let client = Client::new();
+    let response = client
+        .request(
+            Method::POST,
+            format!("{}/tenant/{}/timeline", node.base_url(), tenant_shard_id),
+        )
+        .json(req)
+        .send()
+        .await?;
+    response.error_for_status_ref()?;
+
+    Ok(response.json().await?)
+}
+
 async fn handle_tenant_timeline_create(mut req: Request<Body>) -> Result<Response<Body>, ApiError> {
     let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
     let mut create_req = json_request::<TimelineCreateRequest>(&mut req).await?;
 
     let state = get_state(&req).inner.clone();
-    let mut locked = state.write().await;
+    let locked = state.write().await;
 
     tracing::info!(
         "Creating timeline {}/{}, have {} pageservers",
@@ -765,30 +1074,36 @@ async fn handle_tenant_timeline_create(mut req: Request<Body>) -> Result<Respons
         locked.pageservers.len()
     );
 
-    let mut scheduler = Scheduler::new(&locked);
-
-    // Take a snapshot of pageservers
-    let pageservers = locked.pageservers.clone();
+    let locked = match ensure_attached(locked, tenant_id)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e))?
+    {
+        Some(l) => l,
+        None => state.read().await,
+    };
 
     let mut timeline_info = None;
+    let mut targets = Vec::new();
 
-    for (_tenant_shard_id, shard) in locked
-        .tenants
-        .range_mut(TenantShardId::tenant_range(tenant_id))
-    {
-        shard.schedule(&mut scheduler)?;
-        shard.reconcile(&pageservers).await?;
-
+    for (tenant_shard_id, shard) in locked.tenants.range(TenantShardId::tenant_range(tenant_id)) {
         let node_id = shard
             .intent
             .attached
-            .expect("We just scheduled successfully");
-        let node = pageservers
+            .ok_or_else(|| ApiError::InternalServerError(anyhow::anyhow!("Shard not scheduled")))?;
+        let node = locked
+            .pageservers
             .get(&node_id)
             .expect("Pageservers may not be deleted while referenced");
 
-        let shard_timeline_info = shard
-            .timeline_create(node, &create_req)
+        targets.push((*tenant_shard_id, node.clone()));
+    }
+
+    drop(locked);
+
+    for (tenant_shard_id, node) in targets {
+        // TODO: issue shard timeline creates in parallel, once the 0th is done.
+
+        let shard_timeline_info = timeline_create(&tenant_shard_id, &node, &create_req)
             .await
             .map_err(|e| ApiError::Conflict(format!("Failed to create timeline: {e}")))?;
 
@@ -897,7 +1212,9 @@ async fn handle_node_register(mut req: Request<Body>) -> Result<Response<Body>, 
     let state = get_state(&req).inner.clone();
     let mut locked = state.write().await;
 
-    locked.pageservers.insert(
+    let mut new_pageservers = (*locked.pageservers).clone();
+
+    new_pageservers.insert(
         register_req.node_id,
         NodeState {
             id: register_req.node_id,
@@ -907,6 +1224,8 @@ async fn handle_node_register(mut req: Request<Body>) -> Result<Response<Body>, 
             listen_pg_port: register_req.listen_pg_port,
         },
     );
+
+    locked.pageservers = Arc::new(new_pageservers);
 
     tracing::info!(
         "Registered pageserver {}, now have {} pageservers",
@@ -1026,34 +1345,25 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
             child_observed.insert(
                 pageserver,
                 ObservedStateLocation {
-                    conf: Some(LocationConfig {
-                        mode: LocationConfigMode::AttachedSingle,
-                        generation: Some(generation),
-                        secondary_conf: None,
-                        shard_number: child.shard_number.0,
-                        shard_count: child.shard_count.0,
-                        shard_stripe_size: shard_ident.stripe_size.0,
-                        tenant_conf: config.clone(),
-                    }),
+                    conf: Some(attached_location_conf(generation, &child_shard, &config)),
                 },
             );
 
-            locked.tenants.insert(
+            let mut child_state = TenantState::new(
                 child,
-                TenantState {
-                    tenant_shard_id: child,
-                    policy: policy
-                        .clone()
-                        .expect("We set this if any replacements are pushed"),
-                    shard: child_shard,
-                    intent: IntentState::single(Some(pageserver)),
-                    generation,
-                    observed: ObservedState {
-                        locations: child_observed,
-                    },
-                    config: config.clone(),
-                },
+                child_shard,
+                policy
+                    .clone()
+                    .expect("We set this if any replacements are pushed"),
             );
+            child_state.intent = IntentState::single(Some(pageserver));
+            child_state.observed = ObservedState {
+                locations: child_observed,
+            };
+            child_state.generation = generation;
+            child_state.config = config.clone();
+
+            locked.tenants.insert(child, child_state);
 
             response.new_shards.push(child);
         }
@@ -1069,7 +1379,9 @@ async fn handle_status(_req: Request<Body>) -> Result<Response<Body>, ApiError> 
     json_response(StatusCode::OK, ())
 }
 
-fn make_router(persistent_state: PersistentState) -> RouterBuilder<hyper::Body, ApiError> {
+fn make_router(
+    persistent_state: Arc<tokio::sync::RwLock<PersistentState>>,
+) -> RouterBuilder<hyper::Body, ApiError> {
     endpoint::make_router()
         .data(Arc::new(State::new(persistent_state)))
         .get("/status", |r| request_span(r, handle_status))
@@ -1105,10 +1417,13 @@ async fn main() -> anyhow::Result<()> {
         args.listen
     );
 
-    let persistent_state = PersistentState::load_or_new(&args.path).await;
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistent_state = Arc::new(tokio::sync::RwLock::new(
+        PersistentState::load_or_new(&args.path, result_tx).await,
+    ));
 
     let http_listener = tcp_listener::bind(args.listen)?;
-    let router = make_router(persistent_state)
+    let router = make_router(persistent_state.clone())
         .build()
         .map_err(|err| anyhow!(err))?;
     let service = utils::http::RouterService::new(router).unwrap();
@@ -1117,6 +1432,33 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Serving on {0}", args.listen);
 
     tokio::task::spawn(server);
+
+    tokio::task::spawn(async move {
+        while let Some(result) = result_rx.recv().await {
+            let mut locked = persistent_state.write().await;
+            if let Some(tenant) = locked.tenants.get_mut(&result.tenant_shard_id) {
+                tenant.generation = result.generation;
+                match result.result {
+                    Ok(()) => {
+                        tenant.observed = result.observed;
+                        tenant.waiter.advance(result.sequence);
+                    }
+                    Err(e) => {
+                        // TODO: some observability, record on teh tenant its last reconcile error
+                        tracing::warn!(
+                            "Reconcile error on tenant {}: {}",
+                            tenant.tenant_shard_id,
+                            e
+                        );
+
+                        for (node_id, o) in result.observed.locations {
+                            tenant.observed.locations.insert(node_id, o);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     ShutdownSignals::handle(|signal| match signal {
         Signal::Interrupt | Signal::Terminate | Signal::Quit => {
