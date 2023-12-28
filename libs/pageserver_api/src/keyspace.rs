@@ -124,6 +124,8 @@ impl KeySpaceAccum {
                 if range.start == accum.end {
                     accum.end = range.end;
                 } else {
+                    // TODO: to efficiently support small sharding stripe sizes, we should avoid starting
+                    // a new range here if the skipped region was all keys that don't belong on this shard.
                     assert!(range.start > accum.end);
                     self.ranges.push(accum.clone());
                     *accum = range;
