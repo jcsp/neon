@@ -85,6 +85,18 @@ pub struct TenantLocateResponse {
     pub shard_params: ShardParameters,
 }
 
+/// Explicitly migrating a particular shard is a low level operation
+/// TODO: higher level "Reschedule tenant" operation where the request
+/// specifies some constraints, e.g. asking it to get off particular node(s)
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TenantShardMigrateRequest {
+    pub tenant_shard_id: TenantShardId,
+    pub node_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TenantShardMigrateResponse {}
+
 impl AttachmentService {
     pub fn from_env(env: &LocalEnv) -> Self {
         let path = env.base_data_dir.join("attachments.json");
@@ -257,6 +269,23 @@ impl AttachmentService {
     pub async fn tenant_locate(&self, tenant_id: TenantId) -> anyhow::Result<TenantLocateResponse> {
         self.dispatch::<(), _>(Method::GET, format!("tenant/{tenant_id}/locate"), None)
             .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn tenant_migrate(
+        &self,
+        tenant_shard_id: TenantShardId,
+        node_id: NodeId,
+    ) -> anyhow::Result<TenantShardMigrateResponse> {
+        self.dispatch(
+            Method::PUT,
+            format!("tenant/{tenant_shard_id}/migrate"),
+            Some(TenantShardMigrateRequest {
+                tenant_shard_id,
+                node_id,
+            }),
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(%tenant_id, %new_shard_count))]

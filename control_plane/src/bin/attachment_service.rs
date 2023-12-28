@@ -6,6 +6,9 @@
 ///
 use anyhow::anyhow;
 use clap::Parser;
+use control_plane::endpoint::ComputeControlPlane;
+use control_plane::local_env::LocalEnv;
+use control_plane::pageserver::PageServerNode;
 use hyper::{Body, Request, Response};
 use hyper::{Method, StatusCode};
 use pageserver_api::models::{
@@ -13,7 +16,8 @@ use pageserver_api::models::{
     TenantCreateRequest, TenantLocationConfigRequest, TenantShardSplitRequest,
     TenantShardSplitResponse, TimelineCreateRequest, TimelineInfo,
 };
-use pageserver_api::shard::{ShardCount, ShardIdentity, ShardNumber, TenantShardId};
+use pageserver_api::shard::{ShardCount, ShardIdentity, ShardIndex, ShardNumber, TenantShardId};
+use postgres_connection::parse_host_port;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -25,8 +29,9 @@ use tokio_util::sync::CancellationToken;
 use utils::generation::Generation;
 use utils::http::endpoint::request_span;
 use utils::http::request::parse_request_param;
-use utils::id::TenantId;
+use utils::id::{TenantId, TimelineId};
 use utils::logging::{self, LogFormat};
+use utils::lsn::Lsn;
 use utils::seqwait::{MonotonicCounter, SeqWait, SeqWaitError};
 use utils::signals::{ShutdownSignals, Signal};
 
@@ -49,8 +54,10 @@ use pageserver_api::control_api::{
 use control_plane::attachment_service::{
     AttachHookRequest, AttachHookResponse, InspectRequest, InspectResponse, NodeRegisterRequest,
     TenantCreateResponse, TenantCreateResponseShard, TenantLocateResponse,
-    TenantLocateResponseShard,
+    TenantLocateResponseShard, TenantShardMigrateRequest, TenantShardMigrateResponse,
 };
+
+const RECONCILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -101,7 +108,7 @@ struct ObservedState {
     locations: HashMap<NodeId, ObservedStateLocation>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct IntentState {
     attached: Option<NodeId>,
     secondary: Vec<NodeId>,
@@ -146,6 +153,12 @@ struct ReconcileResult {
 #[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Copy, Clone)]
 struct Sequence(u64);
 
+impl std::fmt::Display for Sequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl MonotonicCounter<Sequence> for Sequence {
     fn cnt_advance(&mut self, v: Sequence) {
         assert!(*self <= v);
@@ -153,6 +166,12 @@ impl MonotonicCounter<Sequence> for Sequence {
     }
     fn cnt_value(&self) -> Sequence {
         *self
+    }
+}
+
+impl Sequence {
+    fn next(&self) -> Sequence {
+        Sequence(self.0 + 1)
     }
 }
 
@@ -181,6 +200,103 @@ impl ReconcilerWaiter {
 
 fn default_waiter() -> std::sync::Arc<SeqWait<Sequence, Sequence>> {
     std::sync::Arc::new(SeqWait::new(Sequence(1)))
+}
+
+struct ComputeHookTenant {
+    shards: Vec<(ShardIndex, NodeId)>,
+}
+
+impl ComputeHookTenant {
+    async fn maybe_reconfigure(&mut self, tenant_id: TenantId) -> anyhow::Result<()> {
+        // Find the highest shard count and drop any shards that aren't
+        // for that shard count.
+        let shard_count = self.shards.iter().map(|(k, _v)| k.shard_count).max();
+        let Some(shard_count) = shard_count else {
+            // No shards, nothing to do.
+            tracing::info!("ComputeHookTenant::maybe_reconfigure: no shards");
+            return Ok(());
+        };
+
+        self.shards.retain(|(k, _v)| k.shard_count == shard_count);
+        self.shards
+            .sort_by_key(|(shard, _node_id)| shard.shard_number);
+
+        if self.shards.len() == shard_count.0 as usize {
+            // We have pageservers for all the shards: proceed to reconfigure compute
+            let env = LocalEnv::load_config().expect("Error loading config");
+            let cplane = ComputeControlPlane::load(env.clone())
+                .expect("Error loading compute control plane");
+
+            let compute_pageservers = self
+                .shards
+                .iter()
+                .map(|(_shard, node_id)| {
+                    let ps_conf = env
+                        .get_pageserver_conf(*node_id)
+                        .expect("Unknown pageserver");
+                    let (pg_host, pg_port) = parse_host_port(&ps_conf.listen_pg_addr)
+                        .expect("Unable to parse listen_pg_addr");
+                    (pg_host, pg_port.unwrap_or(5432))
+                })
+                .collect::<Vec<_>>();
+
+            for (endpoint_name, endpoint) in &cplane.endpoints {
+                if endpoint.tenant_id == tenant_id && endpoint.status() == "running" {
+                    tracing::info!("🔁 Reconfiguring endpoint {}", endpoint_name,);
+                    endpoint.reconfigure(compute_pageservers.clone()).await?;
+                }
+            }
+        } else {
+            tracing::info!(
+                "ComputeHookTenant::maybe_reconfigure: not enough shards ({}/{})",
+                self.shards.len(),
+                shard_count.0
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// The compute hook is a destination for notifications about changes to tenant:pageserver
+/// mapping.  It aggregates updates for the shards in a tenant, and when appropriate reconfigures
+/// the compute connection string.
+struct ComputeHook {
+    state: tokio::sync::Mutex<HashMap<TenantId, ComputeHookTenant>>,
+}
+
+impl ComputeHook {
+    fn new() -> Self {
+        Self {
+            state: Default::default(),
+        }
+    }
+
+    async fn notify(&self, tenant_shard_id: TenantShardId, node_id: NodeId) -> anyhow::Result<()> {
+        tracing::info!("ComputeHook::notify: {}->{}", tenant_shard_id, node_id);
+        let mut locked = self.state.lock().await;
+        let entry = locked
+            .entry(tenant_shard_id.tenant_id)
+            .or_insert_with(|| ComputeHookTenant { shards: Vec::new() });
+
+        let shard_index = ShardIndex {
+            shard_count: tenant_shard_id.shard_count,
+            shard_number: tenant_shard_id.shard_number,
+        };
+
+        let mut set = false;
+        for (existing_shard, existing_node) in &mut entry.shards {
+            if *existing_shard == shard_index {
+                *existing_node = node_id;
+                set = true;
+            }
+        }
+        if !set {
+            entry.shards.push((shard_index, node_id));
+        }
+
+        entry.maybe_reconfigure(tenant_shard_id.tenant_id).await
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,6 +363,8 @@ struct ServiceState {
     tenants: BTreeMap<TenantShardId, TenantState>,
 
     pageservers: Arc<HashMap<NodeId, NodeState>>,
+
+    compute_hook: Arc<ComputeHook>,
 
     result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
 }
@@ -357,8 +475,10 @@ impl TenantState {
         &mut self,
         result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
         pageservers: &Arc<HashMap<NodeId, NodeState>>,
+        compute_hook: &Arc<ComputeHook>,
     ) -> Option<ReconcilerWaiter> {
         if !self.dirty() {
+            tracing::info!("Not dirty, no reconciliation needed.");
             return None;
         }
 
@@ -386,11 +506,13 @@ impl TenantState {
             config: self.config.clone(),
             observed: self.observed.clone(),
             pageservers: pageservers.clone(),
+            compute_hook: compute_hook.clone(),
             cancel: cancel.clone(),
         };
 
         let reconcile_seq = self.sequence;
 
+        tracing::info!("Spawning Reconciler for sequence {}", self.sequence);
         let join_handle = tokio::task::spawn(async move {
             // Wait for any previous reconcile task to complete before we start
             if let Some(old_handle) = old_handle {
@@ -452,6 +574,10 @@ struct Reconciler {
     /// to reconcile.
     pageservers: Arc<HashMap<NodeId, NodeState>>,
 
+    /// A hook to notify the running postgres instances when we change the location
+    /// of a tenant
+    compute_hook: Arc<ComputeHook>,
+
     /// A means to abort background reconciliation: it is essential to
     /// call this when something changes in the original TenantState that
     /// will make this reconciliation impossible or unnecessary, for
@@ -490,13 +616,22 @@ fn secondary_location_conf(shard: &ShardIdentity, config: &TenantConfig) -> Loca
 
 impl Reconciler {
     async fn location_config(
-        &self,
-        node: &NodeState,
+        &mut self,
+        node_id: NodeId,
         config: LocationConfig,
     ) -> anyhow::Result<()> {
+        let node = self
+            .pageservers
+            .get(&node_id)
+            .expect("Pageserver may not be removed while referenced");
+
+        self.observed
+            .locations
+            .insert(node.id, ObservedStateLocation { conf: None });
+
         let configure_request = TenantLocationConfigRequest {
             tenant_shard_id: self.tenant_shard_id,
-            config,
+            config: config.clone(),
         };
 
         let client = Client::new();
@@ -512,12 +647,280 @@ impl Reconciler {
             .json(&configure_request)
             .send()
             .await?;
+
+        self.observed
+            .locations
+            .insert(node.id, ObservedStateLocation { conf: Some(config) });
+
         response.error_for_status()?;
 
         Ok(())
     }
 
+    async fn maybe_live_migrate(&mut self) -> Result<(), ReconcileError> {
+        let destination = if let Some(node_id) = self.intent.attached {
+            match self.observed.locations.get(&node_id) {
+                Some(conf) => {
+                    // We will do a live migration only if the intended destination is not
+                    // currently in an attached state.
+                    match &conf.conf {
+                        Some(conf) if conf.mode == LocationConfigMode::Secondary => {
+                            // Fall through to do a live migration
+                            node_id
+                        }
+                        None | Some(_) => {
+                            // Attached or uncertain: don't do a live migration, proceed
+                            // with a general-case reconciliation
+                            tracing::info!("maybe_live_migrate: destination is None or attached");
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    // Our destination is not attached: maybe live migrate if some other
+                    // node is currently attached.  Fall through.
+                    node_id
+                }
+            }
+        } else {
+            // No intent to be attached
+            tracing::info!("maybe_live_migrate: no attached intent");
+            return Ok(());
+        };
+
+        let mut origin = None;
+        for (node_id, state) in &self.observed.locations {
+            if let Some(observed_conf) = &state.conf {
+                if observed_conf.mode == LocationConfigMode::AttachedSingle {
+                    origin = Some(*node_id);
+                    break;
+                }
+            }
+        }
+
+        let Some(origin) = origin else {
+            tracing::info!("maybe_live_migrate: no origin found");
+            return Ok(());
+        };
+
+        // We have an origin and a destination: proceed to do the live migration
+        let env = LocalEnv::load_config().expect("Error loading config");
+        let origin_ps = PageServerNode::from_env(
+            &env,
+            env.get_pageserver_conf(origin)
+                .expect("Conf missing pageserver"),
+        );
+        let destination_ps = PageServerNode::from_env(
+            &env,
+            env.get_pageserver_conf(destination)
+                .expect("Conf missing pageserver"),
+        );
+
+        tracing::info!(
+            "Live migrating {}->{}",
+            origin_ps.conf.id,
+            destination_ps.conf.id
+        );
+        self.live_migrate(origin_ps, destination_ps).await?;
+
+        Ok(())
+    }
+
+    pub async fn live_migrate(
+        &mut self,
+        origin_ps: PageServerNode,
+        dest_ps: PageServerNode,
+    ) -> anyhow::Result<()> {
+        // `maybe_live_migrate` is responsibble for sanity of inputs
+        assert!(origin_ps.conf.id != dest_ps.conf.id);
+
+        fn build_location_config(
+            shard: &ShardIdentity,
+            config: &TenantConfig,
+            mode: LocationConfigMode,
+            generation: Option<Generation>,
+            secondary_conf: Option<LocationConfigSecondary>,
+        ) -> LocationConfig {
+            LocationConfig {
+                mode,
+                generation: generation.map(|g| g.into().unwrap()),
+                secondary_conf,
+                tenant_conf: config.clone(),
+                shard_number: shard.number.0,
+                shard_count: shard.count.0,
+                shard_stripe_size: shard.stripe_size.0,
+            }
+        }
+
+        async fn get_lsns(
+            tenant_shard_id: TenantShardId,
+            pageserver: &PageServerNode,
+        ) -> anyhow::Result<HashMap<TimelineId, Lsn>> {
+            let timelines = pageserver.timeline_list(&tenant_shard_id).await?;
+            Ok(timelines
+                .into_iter()
+                .map(|t| (t.timeline_id, t.last_record_lsn))
+                .collect())
+        }
+
+        async fn await_lsn(
+            tenant_shard_id: TenantShardId,
+            pageserver: &PageServerNode,
+            baseline: HashMap<TimelineId, Lsn>,
+        ) -> anyhow::Result<()> {
+            loop {
+                let latest = match get_lsns(tenant_shard_id, pageserver).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        println!(
+                            "🕑 Can't get LSNs on pageserver {} yet, waiting ({e})",
+                            pageserver.conf.id
+                        );
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+
+                let mut any_behind: bool = false;
+                for (timeline_id, baseline_lsn) in &baseline {
+                    match latest.get(timeline_id) {
+                        Some(latest_lsn) => {
+                            println!("🕑 LSN origin {baseline_lsn} vs destination {latest_lsn}");
+                            if latest_lsn < baseline_lsn {
+                                any_behind = true;
+                            }
+                        }
+                        None => {
+                            // Expected timeline isn't yet visible on migration destination.
+                            // (IRL we would have to account for timeline deletion, but this
+                            //  is just test helper)
+                            any_behind = true;
+                        }
+                    }
+                }
+
+                if !any_behind {
+                    println!("✅ LSN caught up.  Proceeding...");
+                    break;
+                } else {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+
+            Ok(())
+        }
+
+        tracing::info!(
+            "🔁 Switching origin pageserver {} to stale mode",
+            origin_ps.conf.id
+        );
+
+        // FIXME: it is incorrect to use self.generation here, we should use the generation
+        // from the ObservedState of the origin pageserver (it might be older than self.generation)
+        let stale_conf = build_location_config(
+            &self.shard,
+            &self.config,
+            LocationConfigMode::AttachedStale,
+            Some(self.generation),
+            None,
+        );
+        origin_ps
+            .location_config(
+                self.tenant_shard_id,
+                stale_conf,
+                Some(Duration::from_secs(10)),
+            )
+            .await?;
+
+        let baseline_lsns = Some(get_lsns(self.tenant_shard_id, &origin_ps).await?);
+
+        // Increment generation before attaching to new pageserver
+        self.generation = self.generation.next();
+
+        let dest_conf = build_location_config(
+            &self.shard,
+            &self.config,
+            LocationConfigMode::AttachedMulti,
+            Some(self.generation),
+            None,
+        );
+
+        tracing::info!("🔁 Attaching to pageserver {}", dest_ps.conf.id);
+        dest_ps
+            .location_config(self.tenant_shard_id, dest_conf, None)
+            .await?;
+
+        if let Some(baseline) = baseline_lsns {
+            tracing::info!("🕑 Waiting for LSN to catch up...");
+            await_lsn(self.tenant_shard_id, &dest_ps, baseline).await?;
+        }
+
+        tracing::info!("🔁 Notifying compute to use pageserver {}", dest_ps.conf.id);
+        self.compute_hook
+            .notify(self.tenant_shard_id, dest_ps.conf.id)
+            .await?;
+
+        // Downgrade the origin to secondary.  If the tenant's policy is PlacementPolicy::Single, then
+        // this location will be deleted in the general case reconciliation that runs after this.
+        let origin_secondary_conf = build_location_config(
+            &self.shard,
+            &self.config,
+            LocationConfigMode::Secondary,
+            None,
+            Some(LocationConfigSecondary { warm: true }),
+        );
+        origin_ps
+            .location_config(self.tenant_shard_id, origin_secondary_conf.clone(), None)
+            .await?;
+        // TODO: we should also be setting the ObservedState on earlier API calls, in case we fail
+        // partway through.  In fact, all location conf API calls should be in a wrapper that sets
+        // the observed state to None, then runs, then sets it to what we wrote.
+        self.observed.locations.insert(
+            origin_ps.conf.id,
+            ObservedStateLocation {
+                conf: Some(origin_secondary_conf),
+            },
+        );
+
+        println!(
+            "🔁 Switching to AttachedSingle mode on pageserver {}",
+            dest_ps.conf.id
+        );
+        let dest_final_conf = build_location_config(
+            &self.shard,
+            &self.config,
+            LocationConfigMode::AttachedSingle,
+            Some(self.generation),
+            None,
+        );
+        dest_ps
+            .location_config(self.tenant_shard_id, dest_final_conf.clone(), None)
+            .await?;
+        self.observed.locations.insert(
+            dest_ps.conf.id,
+            ObservedStateLocation {
+                conf: Some(dest_final_conf),
+            },
+        );
+
+        println!("✅ Migration complete");
+
+        Ok(())
+    }
+
+    /// Reconciling a tenant makes API calls to pageservers until the observed state
+    /// matches the intended state.
+    ///
+    /// First we apply special case handling (e.g. for live migrations), and then a
+    /// general case reconciliation where we walk through the intent by pageserver
+    /// and call out to the pageserver to apply the desired state.
     async fn reconcile(&mut self) -> Result<(), ReconcileError> {
+        // TODO: if any of self.observed is None, call to remote pageservers
+        // to learn correct state.
+
+        // Special case: live migration
+        self.maybe_live_migrate().await?;
+
         // If the attached pageserver is not attached, do so now.
         if let Some(node_id) = self.intent.attached {
             let mut wanted_conf =
@@ -532,17 +935,14 @@ impl Reconciler {
                     self.generation = self.generation.next();
                     wanted_conf.generation = self.generation.into();
                     tracing::info!("Observed configuration requires update.");
-                    let node = self
-                        .pageservers
-                        .get(&node_id)
-                        .expect("Pageserver may not be removed while referenced");
-                    self.location_config(node, wanted_conf).await?;
+                    self.location_config(node_id, wanted_conf).await?;
                 }
             }
         }
 
         // Configure secondary locations: if these were previously attached this
         // implicitly downgrades them from attached to secondary.
+        let mut changes = Vec::new();
         for node_id in &self.intent.secondary {
             let wanted_conf = secondary_location_conf(&self.shard, &self.config);
             match self.observed.locations.get(&node_id) {
@@ -553,11 +953,7 @@ impl Reconciler {
                 Some(_) | None => {
                     // If there is no observed configuration, or if its value does not equal our intent, then we must call out to the pageserver.
                     tracing::info!(%node_id, "Observed configuration requires update.");
-                    let node = self
-                        .pageservers
-                        .get(&node_id)
-                        .expect("Pageserver may not be removed while referenced");
-                    self.location_config(node, wanted_conf).await?;
+                    changes.push((*node_id, wanted_conf))
                 }
             }
         }
@@ -571,12 +967,8 @@ impl Reconciler {
                 continue;
             }
 
-            let node = self
-                .pageservers
-                .get(node_id)
-                .expect("Pageserver may not be removed while referenced");
-            self.location_config(
-                node,
+            changes.push((
+                *node_id,
                 LocationConfig {
                     mode: LocationConfigMode::Detached,
                     generation: None,
@@ -586,8 +978,11 @@ impl Reconciler {
                     shard_stripe_size: self.shard.stripe_size.0,
                     tenant_conf: self.config.clone(),
                 },
-            )
-            .await?;
+            ));
+        }
+
+        for (node_id, conf) in changes {
+            self.location_config(node_id, conf).await?;
         }
 
         Ok(())
@@ -910,12 +1305,15 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
 
         let mut waiters = Vec::new();
         let result_tx = locked.result_tx.clone();
+        let compute_hook = locked.compute_hook.clone();
 
         for (_tenant_shard_id, shard) in locked
             .tenants
             .range_mut(TenantShardId::tenant_range(tenant_id))
         {
-            if let Some(waiter) = shard.maybe_reconcile(result_tx.clone(), &pageservers) {
+            if let Some(waiter) =
+                shard.maybe_reconcile(result_tx.clone(), &pageservers, &compute_hook)
+            {
                 waiters.push(waiter);
             }
         }
@@ -952,13 +1350,16 @@ fn ensure_attached<'a>(
     let result_tx = locked.result_tx.clone();
     let mut scheduler = Scheduler::new(&locked);
     let pageservers = locked.pageservers.clone();
+    let compute_hook = locked.compute_hook.clone();
+
     for (_tenant_shard_id, shard) in locked
         .tenants
         .range_mut(TenantShardId::tenant_range(tenant_id))
     {
         shard.schedule(&mut scheduler)?;
 
-        if let Some(waiter) = shard.maybe_reconcile(result_tx.clone(), &pageservers) {
+        if let Some(waiter) = shard.maybe_reconcile(result_tx.clone(), &pageservers, &compute_hook)
+        {
             waiters.push(waiter);
         }
     }
@@ -1214,6 +1615,8 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
                 .get(&node_id)
                 .expect("Pageservers may not be deleted while referenced");
 
+            // TODO: if any reconciliation is currently in progress for this shard, wait for it.
+
             targets.push((*tenant_shard_id, node.clone()));
         }
         targets
@@ -1323,6 +1726,65 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
     json_response(StatusCode::OK, response)
 }
 
+async fn handle_tenant_shard_migrate(mut req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    let tenant_shard_id: TenantShardId = parse_request_param(&req, "tenant_shard_id")?;
+    let migrate_req = json_request::<TenantShardMigrateRequest>(&mut req).await?;
+    let state = get_state(&req).inner.clone();
+    let waiter = {
+        let mut locked = state.write().unwrap();
+
+        let result_tx = locked.result_tx.clone();
+        let pageservers = locked.pageservers.clone();
+        let compute_hook = locked.compute_hook.clone();
+
+        let Some(shard) = locked.tenants.get_mut(&tenant_shard_id) else {
+            return Err(ApiError::NotFound(
+                anyhow::anyhow!("Tenant shard not found").into(),
+            ));
+        };
+
+        if shard.intent.attached == Some(migrate_req.node_id) {
+            // No-op case: we will still proceed to wait for reconciliation in case it is
+            // incomplete from an earlier update to the intent.
+            tracing::info!("Migrating: intent is unchanged {:?}", shard.intent);
+        } else {
+            let old_attached = shard.intent.attached;
+
+            shard.intent.attached = Some(migrate_req.node_id);
+            match shard.policy {
+                PlacementPolicy::Single => {
+                    shard.intent.secondary.clear();
+                }
+                PlacementPolicy::Double(_n) => {
+                    // If our new attached node was a secondary, it no longer should be.
+                    shard.intent.secondary.retain(|s| s != &migrate_req.node_id);
+
+                    // If we were already attached to something, demote that to a secondary
+                    if let Some(old_attached) = old_attached {
+                        shard.intent.secondary.push(old_attached);
+                    }
+                }
+            }
+
+            tracing::info!("Migrating: new intent {:?}", shard.intent);
+            shard.sequence = shard.sequence.next();
+        }
+
+        shard.maybe_reconcile(result_tx, &pageservers, &compute_hook)
+    };
+
+    if let Some(waiter) = waiter {
+        waiter
+            .wait_timeout(RECONCILE_TIMEOUT)
+            .await
+            .map_err(|e| ApiError::Timeout(format!("{}", e).into()))?;
+    } else {
+        tracing::warn!("Migration is a no-op");
+    }
+
+    json_response(StatusCode::OK, TenantShardMigrateResponse {})
+}
+
 /// Status endpoint is just used for checking that our HTTP listener is up
 async fn handle_status(_req: Request<Body>) -> Result<Response<Body>, ApiError> {
     json_response(StatusCode::OK, ())
@@ -1349,6 +1811,9 @@ fn make_router(
         .put("/tenant/:tenant_id/shard_split", |r| {
             request_span(r, handle_tenant_shard_split)
         })
+        .put("/tenant/:tenant_shard_id/migrate", |r| {
+            request_span(r, handle_tenant_shard_migrate)
+        })
 }
 
 #[tokio::main]
@@ -1372,6 +1837,7 @@ async fn main() -> anyhow::Result<()> {
         tenants: BTreeMap::new(),
         pageservers: Arc::new(HashMap::new()),
         result_tx,
+        compute_hook: Arc::new(ComputeHook::new()),
     }));
 
     let http_listener = tcp_listener::bind(args.listen)?;
@@ -1387,11 +1853,27 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::task::spawn(async move {
         while let Some(result) = result_rx.recv().await {
+            tracing::info!(
+                "Reconcile result for sequence {}, ok={}",
+                result.sequence,
+                result.result.is_ok()
+            );
             let mut locked = service_state.write().unwrap();
             if let Some(tenant) = locked.tenants.get_mut(&result.tenant_shard_id) {
                 tenant.generation = result.generation;
                 match result.result {
                     Ok(()) => {
+                        for (node_id, loc) in &result.observed.locations {
+                            if let Some(conf) = &loc.conf {
+                                tracing::info!(
+                                    "Updating observed location {}: {:?}",
+                                    node_id,
+                                    conf
+                                );
+                            } else {
+                                tracing::info!("Setting observed location {} to None", node_id,)
+                            }
+                        }
                         tenant.observed = result.observed;
                         tenant.waiter.advance(result.sequence);
                     }

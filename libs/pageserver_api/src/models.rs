@@ -290,7 +290,7 @@ pub struct TenantConfig {
 /// A flattened analog of a `pagesever::tenant::LocationMode`, which
 /// lists out all possible states (and the virtual "Detached" state)
 /// in a flat form rather than using rust-style enums.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub enum LocationConfigMode {
     AttachedSingle,
     AttachedMulti,
@@ -299,14 +299,14 @@ pub enum LocationConfigMode {
     Detached,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct LocationConfigSecondary {
     pub warm: bool,
 }
 
 /// An alternative representation of `pageserver::tenant::LocationConf`,
 /// for use in external-facing APIs.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct LocationConfig {
     pub mode: LocationConfigMode,
     /// If attaching, in what generation?

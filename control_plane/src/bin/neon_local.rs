@@ -13,7 +13,6 @@ use control_plane::endpoint::ComputeControlPlane;
 use control_plane::local_env::LocalEnv;
 use control_plane::pageserver::{PageServerNode, PAGESERVER_REMOTE_STORAGE_DIR};
 use control_plane::safekeeper::SafekeeperNode;
-use control_plane::tenant_migration::migrate_tenant;
 use control_plane::{broker, local_env};
 use pageserver_api::models::{
     ShardParameters, TenantCreateRequest, TimelineCreateRequest, TimelineInfo,
@@ -517,7 +516,11 @@ async fn handle_tenant(
             let new_pageserver = get_pageserver(env, matches)?;
             let new_pageserver_id = new_pageserver.conf.id;
 
-            migrate_tenant(env, tenant_shard_id, new_pageserver).await?;
+            let attachment_service = AttachmentService::from_env(env);
+            attachment_service
+                .tenant_migrate(tenant_shard_id, new_pageserver_id)
+                .await?;
+
             println!("tenant {tenant_shard_id} migrated to {}", new_pageserver_id);
         }
         Some(("split", matches)) => {
