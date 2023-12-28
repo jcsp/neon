@@ -1,7 +1,7 @@
 
 FINAL_SHARDS=4
 TENANT_ID=1f359dd625e519a1a4e8d7509690f6fc
-ARGS=--release -q
+ARGS="--release -q"
 
 cargo neon $ARGS endpoint stop ep-main
 
