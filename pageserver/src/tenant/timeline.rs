@@ -3066,7 +3066,7 @@ impl Timeline {
                                 }
                             }
                         };
-                        if self.shard_identity.is_key_local(&key) {
+                        if !self.shard_identity.is_key_disposable(&key) {
                             image_layer_writer.put_image(key, &img).await?;
                         }
                         key = key.next();
@@ -3638,7 +3638,7 @@ impl Timeline {
                 )))
             });
 
-            if self.shard_identity.is_key_local(&key) {
+            if !self.shard_identity.is_key_disposable(&key) {
                 writer.as_mut().unwrap().put_value(key, lsn, value).await?;
             }
 
