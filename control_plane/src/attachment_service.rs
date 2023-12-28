@@ -67,6 +67,14 @@ pub struct NodeRegisterRequest {
     pub listen_http_port: u16,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct NodeConfigureRequest {
+    pub node_id: NodeId,
+
+    pub availability: Option<NodeAvailability>,
+    pub scheduling: Option<NodeSchedulingPolicy>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TenantLocateResponseShard {
     pub shard_id: TenantShardId,
@@ -92,6 +100,31 @@ pub struct TenantLocateResponse {
 pub struct TenantShardMigrateRequest {
     pub tenant_shard_id: TenantShardId,
     pub node_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum NodeAvailability {
+    // Normal, happy state
+    Active,
+    // Offline: Tenants shouldn't try to attach here, but they may assume that their
+    // secondary locations on this node still exist.  Newly added nodes are in this
+    // state until we successfully contact them.
+    Offline,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum NodeSchedulingPolicy {
+    // Normal, happy state
+    Active,
+
+    // A newly added node: gradually move some work here.
+    Filling,
+
+    // Do not schedule new work here, but leave configured locations in place.
+    Pause,
+
+    // Do not schedule work here.  Gracefully move work away, as resources allow.
+    Draining,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

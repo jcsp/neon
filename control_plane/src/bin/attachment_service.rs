@@ -19,7 +19,6 @@ use pageserver_api::models::{
 use pageserver_api::shard::{ShardCount, ShardIdentity, ShardIndex, ShardNumber, TenantShardId};
 use postgres_connection::parse_host_port;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,9 +51,10 @@ use pageserver_api::control_api::{
 };
 
 use control_plane::attachment_service::{
-    AttachHookRequest, AttachHookResponse, InspectRequest, InspectResponse, NodeRegisterRequest,
-    TenantCreateResponse, TenantCreateResponseShard, TenantLocateResponse,
-    TenantLocateResponseShard, TenantShardMigrateRequest, TenantShardMigrateResponse,
+    AttachHookRequest, AttachHookResponse, InspectRequest, InspectResponse, NodeAvailability,
+    NodeConfigureRequest, NodeRegisterRequest, NodeSchedulingPolicy, TenantCreateResponse,
+    TenantCreateResponseShard, TenantLocateResponse, TenantLocateResponseShard,
+    TenantShardMigrateRequest, TenantShardMigrateResponse,
 };
 
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,14 +81,14 @@ struct Cli {
 ///       what it is (e.g. we failed partway through configuring it)
 ///     * Instance exists with conf==Some: this tells us what we last successfully configured on this node,
 ///       and that configuration will still be present unless something external interfered.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 struct ObservedStateLocation {
     /// If None, it means we do not know the status of this shard's location on this node, but
     /// we know that we might have some state on this node.
     conf: Option<LocationConfig>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 enum PlacementPolicy {
     /// Cheapest way to attach a tenant: just one pageserver, no secondary
     Single,
@@ -103,12 +103,12 @@ impl Default for PlacementPolicy {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Default, Clone)]
 struct ObservedState {
     locations: HashMap<NodeId, ObservedStateLocation>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Default, Clone, Debug)]
 struct IntentState {
     attached: Option<NodeId>,
     secondary: Vec<NodeId>,
@@ -150,7 +150,7 @@ struct ReconcileResult {
     observed: ObservedState,
 }
 
-#[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Copy, Clone)]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone)]
 struct Sequence(u64);
 
 impl std::fmt::Display for Sequence {
@@ -196,10 +196,6 @@ impl ReconcilerWaiter {
     async fn wait_timeout(&self, timeout: Duration) -> Result<(), SeqWaitError> {
         self.seq_wait.wait_for_timeout(self.seq, timeout).await
     }
-}
-
-fn default_waiter() -> std::sync::Arc<SeqWait<Sequence, Sequence>> {
-    std::sync::Arc::new(SeqWait::new(Sequence(1)))
 }
 
 struct ComputeHookTenant {
@@ -299,7 +295,6 @@ impl ComputeHook {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct TenantState {
     tenant_shard_id: TenantShardId,
 
@@ -329,18 +324,19 @@ struct TenantState {
     /// If a reconcile task is currently in flight, it may be joined here (it is
     /// only safe to join if either the result has been received or the reconciler's
     /// cancellation token has been fired)
-    #[serde(skip)]
     reconciler: Option<ReconcilerHandle>,
 
     /// Optionally wait for reconciliation to complete up to a particular
     /// sequence number.
-    #[serde(skip, default = "default_waiter")]
     waiter: std::sync::Arc<SeqWait<Sequence, Sequence>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct NodeState {
+#[derive(Clone)]
+struct Node {
     id: NodeId,
+
+    availability: NodeAvailability,
+    scheduling: NodeSchedulingPolicy,
 
     listen_http_addr: String,
     listen_http_port: u16,
@@ -349,7 +345,7 @@ struct NodeState {
     listen_pg_port: u16,
 }
 
-impl NodeState {
+impl Node {
     fn base_url(&self) -> String {
         format!(
             "http://{}:{}/v1",
@@ -362,7 +358,7 @@ impl NodeState {
 struct ServiceState {
     tenants: BTreeMap<TenantShardId, TenantState>,
 
-    pageservers: Arc<HashMap<NodeId, NodeState>>,
+    nodes: Arc<HashMap<NodeId, Node>>,
 
     compute_hook: Arc<ComputeHook>,
 
@@ -474,7 +470,7 @@ impl TenantState {
     fn maybe_reconcile(
         &mut self,
         result_tx: tokio::sync::mpsc::UnboundedSender<ReconcileResult>,
-        pageservers: &Arc<HashMap<NodeId, NodeState>>,
+        pageservers: &Arc<HashMap<NodeId, Node>>,
         compute_hook: &Arc<ComputeHook>,
     ) -> Option<ReconcilerWaiter> {
         if !self.dirty() {
@@ -572,7 +568,7 @@ struct Reconciler {
 
     /// A snapshot of the pageservers as they were when we were asked
     /// to reconcile.
-    pageservers: Arc<HashMap<NodeId, NodeState>>,
+    pageservers: Arc<HashMap<NodeId, Node>>,
 
     /// A hook to notify the running postgres instances when we change the location
     /// of a tenant
@@ -1152,7 +1148,7 @@ struct Scheduler {
 impl Scheduler {
     fn new(service_state: &ServiceState) -> Self {
         let mut tenant_counts = HashMap::new();
-        for node_id in service_state.pageservers.keys() {
+        for node_id in service_state.nodes.keys() {
             tenant_counts.insert(*node_id, 0);
         }
 
@@ -1210,7 +1206,7 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
             "Creating tenant {}, shard_count={:?}, have {} pageservers",
             create_req.new_tenant_id,
             create_req.shard_parameters.count,
-            locked.pageservers.len()
+            locked.nodes.len()
         );
 
         // This service expects to handle sharding itself: it is an error to try and directly create
@@ -1301,7 +1297,7 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
         }
 
         // Take a snapshot of pageservers
-        let pageservers = locked.pageservers.clone();
+        let pageservers = locked.nodes.clone();
 
         let mut waiters = Vec::new();
         let result_tx = locked.result_tx.clone();
@@ -1349,7 +1345,7 @@ fn ensure_attached<'a>(
     let mut waiters = Vec::new();
     let result_tx = locked.result_tx.clone();
     let mut scheduler = Scheduler::new(&locked);
-    let pageservers = locked.pageservers.clone();
+    let pageservers = locked.nodes.clone();
     let compute_hook = locked.compute_hook.clone();
 
     for (_tenant_shard_id, shard) in locked
@@ -1368,7 +1364,7 @@ fn ensure_attached<'a>(
 
 async fn timeline_create(
     tenant_shard_id: &TenantShardId,
-    node: &NodeState,
+    node: &Node,
     req: &TimelineCreateRequest,
 ) -> anyhow::Result<TimelineInfo> {
     let client = Client::new();
@@ -1399,7 +1395,7 @@ async fn handle_tenant_timeline_create(mut req: Request<Body>) -> Result<Respons
             "Creating timeline {}/{}, have {} pageservers",
             tenant_id,
             create_req.new_timeline_id,
-            locked.pageservers.len()
+            locked.nodes.len()
         );
 
         ensure_attached(locked, tenant_id).map_err(|e| ApiError::InternalServerError(e))?
@@ -1429,7 +1425,7 @@ async fn handle_tenant_timeline_create(mut req: Request<Body>) -> Result<Respons
                 ApiError::InternalServerError(anyhow::anyhow!("Shard not scheduled"))
             })?;
             let node = locked
-                .pageservers
+                .nodes
                 .get(&node_id)
                 .expect("Pageservers may not be deleted while referenced");
 
@@ -1471,7 +1467,7 @@ async fn handle_tenant_locate(req: Request<Body>) -> Result<Response<Body>, ApiE
     tracing::info!("Locating shards for tenant {tenant_id}");
 
     // Take a snapshot of pageservers
-    let pageservers = locked.pageservers.clone();
+    let pageservers = locked.nodes.clone();
 
     let mut result = Vec::new();
     let mut shard_params: Option<ShardParameters> = None;
@@ -1550,26 +1546,64 @@ async fn handle_node_register(mut req: Request<Body>) -> Result<Response<Body>, 
     let state = get_state(&req).inner.clone();
     let mut locked = state.write().unwrap();
 
-    let mut new_pageservers = (*locked.pageservers).clone();
+    let mut new_nodes = (*locked.nodes).clone();
 
-    new_pageservers.insert(
+    new_nodes.insert(
         register_req.node_id,
-        NodeState {
+        Node {
             id: register_req.node_id,
             listen_http_addr: register_req.listen_http_addr,
             listen_http_port: register_req.listen_http_port,
             listen_pg_addr: register_req.listen_pg_addr,
             listen_pg_port: register_req.listen_pg_port,
+            scheduling: NodeSchedulingPolicy::Filling,
+            availability: NodeAvailability::Offline,
         },
     );
 
-    locked.pageservers = Arc::new(new_pageservers);
+    locked.nodes = Arc::new(new_nodes);
 
     tracing::info!(
         "Registered pageserver {}, now have {} pageservers",
         register_req.node_id,
-        locked.pageservers.len()
+        locked.nodes.len()
     );
+
+    json_response(StatusCode::OK, ())
+}
+
+async fn handle_node_configure(mut req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    let node_id: NodeId = parse_request_param(&req, "node_id")?;
+    let config_req = json_request::<NodeConfigureRequest>(&mut req).await?;
+    let state = get_state(&req).inner.clone();
+    let mut locked = state.write().unwrap();
+
+    let mut new_nodes = (*locked.nodes).clone();
+    let Some(node) = new_nodes.get_mut(&node_id) else {
+        return Err(ApiError::NotFound(
+            anyhow::anyhow!("Node not registered").into(),
+        ));
+    };
+
+    if let Some(availability) = config_req.availability {
+        if let NodeAvailability::Offline = availability {
+            if let NodeAvailability::Active = node.availability {
+                // We are transitioning Active->Offline: a node failure.  Any tenants
+                // attached to this pageserver need to be rescheduled and reconciled.
+                todo!();
+            }
+        }
+        node.availability = availability;
+    }
+
+    if let Some(scheduling) = config_req.scheduling {
+        node.scheduling = scheduling;
+
+        // TODO: once we have a background scheduling ticker for fill/drain, kick it
+        // to wake up and start working.
+    }
+
+    locked.nodes = Arc::new(new_nodes);
 
     json_response(StatusCode::OK, ())
 }
@@ -1583,7 +1617,7 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
     let targets = {
         let mut locked = state.write().unwrap();
 
-        let pageservers = locked.pageservers.clone();
+        let pageservers = locked.nodes.clone();
 
         let mut targets = Vec::new();
 
@@ -1734,7 +1768,7 @@ async fn handle_tenant_shard_migrate(mut req: Request<Body>) -> Result<Response<
         let mut locked = state.write().unwrap();
 
         let result_tx = locked.result_tx.clone();
-        let pageservers = locked.pageservers.clone();
+        let pageservers = locked.nodes.clone();
         let compute_hook = locked.compute_hook.clone();
 
         let Some(shard) = locked.tenants.get_mut(&tenant_shard_id) else {
@@ -1801,6 +1835,9 @@ fn make_router(
         .post("/attach-hook", |r| request_span(r, handle_attach_hook))
         .post("/inspect", |r| request_span(r, handle_inspect))
         .post("/node", |r| request_span(r, handle_node_register))
+        .put("/node/:node_id/config", |r| {
+            request_span(r, handle_node_configure)
+        })
         .post("/tenant", |r| request_span(r, handle_tenant_create))
         .post("/tenant/:tenant_id/timeline", |r| {
             request_span(r, handle_tenant_timeline_create)
@@ -1835,7 +1872,7 @@ async fn main() -> anyhow::Result<()> {
 
     let service_state = Arc::new(std::sync::RwLock::new(ServiceState {
         tenants: BTreeMap::new(),
-        pageservers: Arc::new(HashMap::new()),
+        nodes: Arc::new(HashMap::new()),
         result_tx,
         compute_hook: Arc::new(ComputeHook::new()),
     }));
