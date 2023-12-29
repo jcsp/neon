@@ -1740,7 +1740,7 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
     let state = get_state(&req).inner.clone();
 
     let mut policy = None;
-    let targets = {
+    let (targets, compute_hook) = {
         let mut locked = state.write().unwrap();
 
         let pageservers = locked.nodes.clone();
@@ -1779,7 +1779,7 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
 
             targets.push((*tenant_shard_id, node.clone()));
         }
-        targets
+        (targets, locked.compute_hook.clone())
     };
 
     let mut replacements = HashMap::new();
@@ -1831,6 +1831,7 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
     let mut response = TenantShardSplitResponse {
         new_shards: Vec::new(),
     };
+    let mut child_locations = Vec::new();
     {
         let mut locked = state.write().unwrap();
         for (replaced, children) in replacements.into_iter() {
@@ -1876,10 +1877,18 @@ async fn handle_tenant_shard_split(mut req: Request<Body>) -> Result<Response<Bo
                 child_state.generation = generation;
                 child_state.config = config.clone();
 
-                locked.tenants.insert(child, child_state);
+                child_locations.push((child, pageserver));
 
+                locked.tenants.insert(child, child_state);
                 response.new_shards.push(child);
             }
+        }
+    }
+
+    for (child_id, child_ps) in child_locations {
+        if let Err(e) = compute_hook.notify(child_id, child_ps).await {
+            tracing::warn!("Failed to update compute of {}->{} during split, proceeding anyway to complete split ({e})",
+                        child_id, child_ps);
         }
     }
 
