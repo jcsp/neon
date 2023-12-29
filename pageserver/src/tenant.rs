@@ -596,10 +596,9 @@ impl Tenant {
         mode: SpawnMode,
         ctx: &RequestContext,
     ) -> anyhow::Result<Arc<Tenant>> {
-        // TODO(sharding): make WalRedoManager shard-aware
         let wal_redo_manager = Arc::new(WalRedoManager::from(PostgresRedoManager::new(
             conf,
-            tenant_shard_id.tenant_id,
+            tenant_shard_id,
         )));
 
         let TenantSharedResources {
@@ -1146,10 +1145,9 @@ impl Tenant {
         tenant_shard_id: TenantShardId,
         reason: String,
     ) -> Arc<Tenant> {
-        // TODO(sharding): make WalRedoManager shard-aware
         let wal_redo_manager = Arc::new(WalRedoManager::from(PostgresRedoManager::new(
             conf,
-            tenant_shard_id.tenant_id,
+            tenant_shard_id,
         )));
         Arc::new(Tenant::new(
             TenantState::Broken {
