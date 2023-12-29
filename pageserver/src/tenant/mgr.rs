@@ -1166,21 +1166,13 @@ impl TenantManager {
 
         self.resources.deletion_queue_client.flush_advisory();
 
-        // Phase 2: Put the parent shard to InProgress and shut it down
+        // Phase 2: Put the parent shard to InProgress and grab a reference to the parent Tenant
         drop(tenant);
         let mut parent_slot_guard =
             tenant_map_acquire_slot(&tenant_shard_id, TenantSlotAcquireMode::Any)?;
-        match parent_slot_guard.get_old_value() {
-            Some(TenantSlot::Attached(t)) => {
-                let (_guard, progress) = completion::channel();
-                match t.shutdown(progress, false).await {
-                    Ok(()) => {}
-                    Err(other) => {
-                        other.wait().await;
-                    }
-                }
-            }
-            Some(TenantSlot::Secondary) => {}
+        let parent = match parent_slot_guard.get_old_value() {
+            Some(TenantSlot::Attached(t)) => t,
+            Some(TenantSlot::Secondary) => anyhow::bail!("Tenant location in secondary mode"),
             Some(TenantSlot::InProgress(_)) => {
                 unreachable!()
             }
@@ -1191,10 +1183,19 @@ impl TenantManager {
                 anyhow::bail!("Detached parent shard in the middle of split!")
             }
         };
-        parent_slot_guard.drop_old_value()?;
 
         // TODO: hardlink layers from the parent into the child shard directories so that they don't immediately re-download
         // TODO: erase the dentries from the parent
+
+        // Take a snapshot of where the parent's WAL ingest had got to: we will wait for
+        // child shards to reach this point.
+        let mut target_lsns = HashMap::new();
+        for timeline in parent.timelines.lock().unwrap().clone().values() {
+            target_lsns.insert(timeline.timeline_id, timeline.get_last_record_lsn());
+        }
+
+        // TODO: we should have the parent shard stop its WAL ingest here, it's a waste of resources
+        // and could slow down the children trying to catch up.
 
         // Phase 3: Spawn the child shards
         for child_shard in &child_shards {
@@ -1215,7 +1216,57 @@ impl TenantManager {
                 .await?;
         }
 
-        // Phase 4: Release the InProgress on the parent shard
+        // Phase 4: wait for child chards WAL ingest to catch up to target LSN
+        for child_shard_id in &child_shards {
+            let child_shard = {
+                let locked = TENANTS.read().unwrap();
+                let peek_slot =
+                    tenant_map_peek_slot(&locked, &child_shard_id, TenantSlotPeekMode::Read)?;
+                peek_slot.map(|s| s.get_attached()).flatten().cloned()
+            };
+            if let Some(t) = child_shard {
+                let timelines = t.timelines.lock().unwrap().clone();
+                for timeline in timelines.values() {
+                    let Some(target_lsn) = target_lsns.get(&timeline.timeline_id) else {
+                        continue;
+                    };
+
+                    tracing::info!(
+                        "Waiting for child shard {}/{} to reach target lsn {}...",
+                        child_shard_id,
+                        timeline.timeline_id,
+                        target_lsn
+                    );
+                    if let Err(e) = timeline.wait_lsn(*target_lsn, ctx).await {
+                        // Failure here might mean shutdown, in any case this part is an optimization
+                        // and we shouldn't hold up the split operation.
+                        tracing::warn!(
+                            "Failed to wait for timeline {} to reach lsn {target_lsn}: {e}",
+                            timeline.timeline_id
+                        );
+                    } else {
+                        tracing::info!(
+                            "Child shard {}/{} reached target lsn {}",
+                            child_shard_id,
+                            timeline.timeline_id,
+                            target_lsn
+                        );
+                    }
+                }
+            }
+        }
+
+        // Phase 5: Shut down the parent shard.
+        let (_guard, progress) = completion::channel();
+        match parent.shutdown(progress, false).await {
+            Ok(()) => {}
+            Err(other) => {
+                other.wait().await;
+            }
+        }
+        parent_slot_guard.drop_old_value()?;
+
+        // Phase 6: Release the InProgress on the parent shard
         drop(parent_slot_guard);
 
         Ok(child_shards)
