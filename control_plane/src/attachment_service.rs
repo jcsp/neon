@@ -11,7 +11,7 @@ use pageserver_api::{
 };
 use postgres_connection::parse_host_port;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{path::PathBuf, process::Child};
+use std::{path::PathBuf, process::Child, str::FromStr};
 use tracing::instrument;
 use utils::id::{NodeId, TenantId};
 
@@ -102,7 +102,7 @@ pub struct TenantShardMigrateRequest {
     pub node_id: NodeId,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum NodeAvailability {
     // Normal, happy state
     Active,
@@ -112,7 +112,19 @@ pub enum NodeAvailability {
     Offline,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+impl FromStr for NodeAvailability {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "offline" => Ok(Self::Offline),
+            _ => Err(anyhow::anyhow!("Unknown availability state '{s}'")),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum NodeSchedulingPolicy {
     // Normal, happy state
     Active,
@@ -125,6 +137,20 @@ pub enum NodeSchedulingPolicy {
 
     // Do not schedule work here.  Gracefully move work away, as resources allow.
     Draining,
+}
+
+impl FromStr for NodeSchedulingPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "filling" => Ok(Self::Filling),
+            "pause" => Ok(Self::Pause),
+            "draining" => Ok(Self::Draining),
+            _ => Err(anyhow::anyhow!("Unknown scheduling state '{s}'")),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -339,6 +365,16 @@ impl AttachmentService {
     pub async fn node_register(&self, req: NodeRegisterRequest) -> anyhow::Result<()> {
         self.dispatch::<_, ()>(Method::POST, "node".to_string(), Some(req))
             .await
+    }
+
+    #[instrument(skip_all, fields(node_id=%req.node_id))]
+    pub async fn node_configure(&self, req: NodeConfigureRequest) -> anyhow::Result<()> {
+        self.dispatch::<_, ()>(
+            Method::PUT,
+            format!("node/{}/config", req.node_id),
+            Some(req),
+        )
+        .await
     }
 
     #[instrument(skip(self))]

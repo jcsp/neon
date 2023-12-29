@@ -133,6 +133,20 @@ impl IntentState {
             secondary: vec![],
         }
     }
+
+    /// When a node goes offline, we update intents to avoid using it
+    /// as their attached pageserver.
+    ///
+    /// Returns true if a change was made
+    fn notify_offline(&mut self, node_id: NodeId) -> bool {
+        if self.attached == Some(node_id) {
+            self.attached = None;
+            self.secondary.push(node_id);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// When a reconcile task completes, it sends this result object
@@ -352,6 +366,21 @@ impl Node {
             self.listen_http_addr, self.listen_http_port
         )
     }
+
+    /// Is this node elegible to have work scheduled onto it?
+    fn may_schedule(&self) -> bool {
+        match self.availability {
+            NodeAvailability::Active => {}
+            NodeAvailability::Offline => return false,
+        }
+
+        match self.scheduling {
+            NodeSchedulingPolicy::Active => true,
+            NodeSchedulingPolicy::Draining => false,
+            NodeSchedulingPolicy::Filling => true,
+            NodeSchedulingPolicy::Pause => false,
+        }
+    }
 }
 
 // Top level state available to all HTTP handlers
@@ -473,7 +502,22 @@ impl TenantState {
         pageservers: &Arc<HashMap<NodeId, Node>>,
         compute_hook: &Arc<ComputeHook>,
     ) -> Option<ReconcilerWaiter> {
-        if !self.dirty() {
+        // If there are any ambiguous observed states, and the nodes they refer to are available,
+        // we should reconcile to clean them up.
+        let mut dirty_observed = false;
+        for (node_id, observed_loc) in &self.observed.locations {
+            let node = pageservers
+                .get(&node_id)
+                .expect("Nodes may not be removed while referenced");
+            if observed_loc.conf.is_none()
+                && !matches!(node.availability, NodeAvailability::Offline)
+            {
+                dirty_observed = true;
+                break;
+            }
+        }
+
+        if !self.dirty() && !dirty_observed {
             tracing::info!("Not dirty, no reconciliation needed.");
             return None;
         }
@@ -688,8 +732,16 @@ impl Reconciler {
         for (node_id, state) in &self.observed.locations {
             if let Some(observed_conf) = &state.conf {
                 if observed_conf.mode == LocationConfigMode::AttachedSingle {
-                    origin = Some(*node_id);
-                    break;
+                    let node = self
+                        .pageservers
+                        .get(node_id)
+                        .expect("Nodes may not be removed while referenced");
+                    // We will only attempt live migration if the origin is not offline: this
+                    // avoids trying to do it while reconciling after responding to an HA failover.
+                    if !matches!(node.availability, NodeAvailability::Offline) {
+                        origin = Some(*node_id);
+                        break;
+                    }
                 }
             }
         }
@@ -932,6 +984,15 @@ impl Reconciler {
                     wanted_conf.generation = self.generation.into();
                     tracing::info!("Observed configuration requires update.");
                     self.location_config(node_id, wanted_conf).await?;
+                    if let Err(e) = self
+                        .compute_hook
+                        .notify(self.tenant_shard_id, node_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to notify compute of newly attached pageserver {node_id}: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -1146,18 +1207,25 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(service_state: &ServiceState) -> Self {
+    fn new(tenants: &BTreeMap<TenantShardId, TenantState>, nodes: &HashMap<NodeId, Node>) -> Self {
         let mut tenant_counts = HashMap::new();
-        for node_id in service_state.nodes.keys() {
+        for node_id in nodes.keys() {
             tenant_counts.insert(*node_id, 0);
         }
 
-        for tenant in service_state.tenants.values() {
+        for tenant in tenants.values() {
             if let Some(ps) = tenant.intent.attached {
                 let entry = tenant_counts.entry(ps).or_insert(0);
                 *entry += 1;
             }
         }
+
+        for (node_id, node) in nodes {
+            if !node.may_schedule() {
+                tenant_counts.remove(node_id);
+            }
+        }
+
         Self { tenant_counts }
     }
 
@@ -1177,7 +1245,9 @@ impl Scheduler {
                 }
             })
             .collect();
-        tenant_counts.sort_by_key(|i| i.1);
+
+        // Sort by tenant count.  Nodes with the same tenant count are sorted by ID.
+        tenant_counts.sort_by_key(|i| (i.1, i.0));
 
         if tenant_counts.is_empty() {
             // After applying constraints, no pageservers were left
@@ -1228,7 +1298,7 @@ async fn handle_tenant_create(mut req: Request<Body>) -> Result<Response<Body>, 
 
         let mut response_shards = Vec::new();
 
-        let mut scheduler = Scheduler::new(&locked);
+        let mut scheduler = Scheduler::new(&locked.tenants, &locked.nodes);
 
         for i in 0..literal_shard_count {
             let shard_number = ShardNumber(i);
@@ -1344,9 +1414,9 @@ fn ensure_attached<'a>(
 ) -> Result<Vec<ReconcilerWaiter>, anyhow::Error> {
     let mut waiters = Vec::new();
     let result_tx = locked.result_tx.clone();
-    let mut scheduler = Scheduler::new(&locked);
-    let pageservers = locked.nodes.clone();
     let compute_hook = locked.compute_hook.clone();
+    let mut scheduler = Scheduler::new(&locked.tenants, &locked.nodes);
+    let pageservers = locked.nodes.clone();
 
     for (_tenant_shard_id, shard) in locked
         .tenants
@@ -1557,7 +1627,8 @@ async fn handle_node_register(mut req: Request<Body>) -> Result<Response<Body>, 
             listen_pg_addr: register_req.listen_pg_addr,
             listen_pg_port: register_req.listen_pg_port,
             scheduling: NodeSchedulingPolicy::Filling,
-            availability: NodeAvailability::Offline,
+            // TODO: we shouldn't really call this Active until we've heartbeated it.
+            availability: NodeAvailability::Active,
         },
     );
 
@@ -1577,23 +1648,36 @@ async fn handle_node_configure(mut req: Request<Body>) -> Result<Response<Body>,
     let config_req = json_request::<NodeConfigureRequest>(&mut req).await?;
     let state = get_state(&req).inner.clone();
     let mut locked = state.write().unwrap();
+    let result_tx = locked.result_tx.clone();
+    let compute_hook = locked.compute_hook.clone();
 
     let mut new_nodes = (*locked.nodes).clone();
+
     let Some(node) = new_nodes.get_mut(&node_id) else {
         return Err(ApiError::NotFound(
             anyhow::anyhow!("Node not registered").into(),
         ));
     };
 
-    if let Some(availability) = config_req.availability {
-        if let NodeAvailability::Offline = availability {
-            if let NodeAvailability::Active = node.availability {
-                // We are transitioning Active->Offline: a node failure.  Any tenants
-                // attached to this pageserver need to be rescheduled and reconciled.
-                todo!();
+    let mut offline_transition = false;
+    let mut active_transition = false;
+
+    if let Some(availability) = &config_req.availability {
+        match (availability, &node.availability) {
+            (NodeAvailability::Offline, NodeAvailability::Active) => {
+                tracing::info!("Node {} transition to offline", node_id);
+                offline_transition = true;
             }
-        }
-        node.availability = availability;
+            (NodeAvailability::Active, NodeAvailability::Offline) => {
+                tracing::info!("Node {} transition to active", node_id);
+                active_transition = true;
+            }
+            _ => {
+                tracing::info!("Node {} no change during config", node_id);
+                // No change
+            }
+        };
+        node.availability = *availability;
     }
 
     if let Some(scheduling) = config_req.scheduling {
@@ -1603,7 +1687,49 @@ async fn handle_node_configure(mut req: Request<Body>) -> Result<Response<Body>,
         // to wake up and start working.
     }
 
-    locked.nodes = Arc::new(new_nodes);
+    let new_nodes = Arc::new(new_nodes);
+
+    let mut scheduler = Scheduler::new(&locked.tenants, &new_nodes);
+    if offline_transition {
+        for (tenant_shard_id, tenant_state) in &mut locked.tenants {
+            if let Some(observed_loc) = tenant_state.observed.locations.get_mut(&node_id) {
+                // When a node goes offline, we set its observed configuration to None, indicating unknown: we will
+                // not assume our knowledge of the node's configuration is accurate until it comes back online
+                observed_loc.conf = None;
+            }
+
+            if tenant_state.intent.notify_offline(node_id) {
+                tenant_state.sequence = tenant_state.sequence.next();
+                match tenant_state.schedule(&mut scheduler) {
+                    Err(e) => {
+                        // It is possible that some tenants will become unschedulable when too many pageservers
+                        // go offline: in this case there isn't much we can do other than make the issue observable.
+                        // TODO: give TenantState a scheduling error attribute to be queried later.
+                        tracing::warn!(%tenant_shard_id, "Scheduling error when marking pageserver {node_id} offline: {e}");
+                    }
+                    Ok(()) => {
+                        tenant_state.maybe_reconcile(result_tx.clone(), &new_nodes, &compute_hook);
+                    }
+                }
+            }
+        }
+    }
+
+    if active_transition {
+        // When a node comes back online, we must reconcile any tenant that has a None observed
+        // location on the node.
+        for (_tenant_shard_id, tenant_state) in &mut locked.tenants {
+            if let Some(observed_loc) = tenant_state.observed.locations.get_mut(&node_id) {
+                if observed_loc.conf.is_none() {
+                    tenant_state.maybe_reconcile(result_tx.clone(), &new_nodes, &compute_hook);
+                }
+            }
+        }
+
+        // TODO: in the background, we should balance work back onto this pageserver
+    }
+
+    locked.nodes = new_nodes;
 
     json_response(StatusCode::OK, ())
 }

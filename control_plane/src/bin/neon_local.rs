@@ -8,7 +8,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 use compute_api::spec::ComputeMode;
-use control_plane::attachment_service::AttachmentService;
+use control_plane::attachment_service::{
+    AttachmentService, NodeAvailability, NodeConfigureRequest, NodeSchedulingPolicy,
+};
 use control_plane::endpoint::ComputeControlPlane;
 use control_plane::local_env::LocalEnv;
 use control_plane::pageserver::{PageServerNode, PAGESERVER_REMOTE_STORAGE_DIR};
@@ -537,6 +539,7 @@ async fn handle_tenant(
                 .await?;
             println!("Split {}->{}", old_shards.len(), new_shard_count);
         }
+
         Some(("status", matches)) => {
             let tenant_id = get_tenant_id(matches, env)?;
 
@@ -1123,6 +1126,21 @@ async fn handle_pageserver(sub_match: &ArgMatches, env: &local_env::LocalEnv) ->
             }
         }
 
+        Some(("set-state", subcommand_args)) => {
+            let pageserver = get_pageserver(env, subcommand_args)?;
+            let scheduling = subcommand_args.get_one("scheduling");
+            let availability = subcommand_args.get_one("availability");
+
+            let attachment_service = AttachmentService::from_env(env);
+            attachment_service
+                .node_configure(NodeConfigureRequest {
+                    node_id: pageserver.conf.id,
+                    scheduling: scheduling.cloned(),
+                    availability: availability.cloned(),
+                })
+                .await?;
+        }
+
         Some(("status", subcommand_args)) => {
             match get_pageserver(env, subcommand_args)?.check_status().await {
                 Ok(_) => println!("Page server is up and running"),
@@ -1553,6 +1571,12 @@ fn cli() -> Command {
                 )
                 .subcommand(Command::new("restart")
                     .about("Restart local pageserver")
+                    .arg(pageserver_config_args.clone())
+                )
+                .subcommand(Command::new("set-state")
+                    .arg(Arg::new("availability").value_parser(value_parser!(NodeAvailability)).long("availability").action(ArgAction::Set).help("Availability state: offline,active"))
+                    .arg(Arg::new("scheduling").value_parser(value_parser!(NodeSchedulingPolicy)).long("scheduling").action(ArgAction::Set).help("Scheduling state: draining,pause,filling,active"))
+                    .about("Set scheduling or availability state of pageserver node")
                     .arg(pageserver_config_args.clone())
                 )
         )
